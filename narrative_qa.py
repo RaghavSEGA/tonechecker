@@ -307,7 +307,7 @@ def _check_auth() -> bool:
     return False
 
 def _render_login():
-    st.markdown('<div style="display:flex;justify-content:center;align-items:center;min-height:70vh;">', unsafe_allow_html=True)
+    st.markdown('<div style="display:flex;justify-content:center;padding-top:10vh;">', unsafe_allow_html=True)
     _, col_c, _ = st.columns([1, 2, 1])
     with col_c:
         st.markdown(
