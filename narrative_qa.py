@@ -293,6 +293,170 @@ def extract_xlsx_text(file) -> str:
         return f"[XLSX extraction error: {exc}]"
 
 
+# ── Script-table parser (CSV / XLSX with SceneID, Talker, Text columns) ────────
+
+# Columns we recognise in SEGA-style script sheets
+_SCRIPT_COLS = {"sceneid", "id", "talker", "text"}
+
+def _is_script_table(headers: list[str]) -> bool:
+    """Return True when the header row matches the expected script column set."""
+    normed = {h.strip().lower() for h in headers if h}
+    return _SCRIPT_COLS.issubset(normed)
+
+
+def extract_script_table(rows: list[dict], use_jb_pass: bool = False) -> str:
+    """
+    Convert a list of row-dicts (keyed by column header) from a SEGA script
+    sheet into a clean script string suitable for NQA analysis.
+
+    Column semantics
+    ----------------
+    SceneID  – scene / event identifier; a change signals a new scene block
+    ID       – unique line ID; empty rows are stage directions / notes
+    Talker   – character name; empty = non-dialogue row
+    Text     – original / source dialogue or stage direction
+    JB PASS  – editorial revision of Text (may be empty)
+    PURPOSE  – note explaining the revision (ignored during extraction)
+
+    Parsing rules
+    -------------
+    * Rows starting with "?" or "<" are system/meta markers → skip entirely
+    * Rows consisting only of dashes → skip (visual separators in the sheet)
+    * Rows where Talker is empty but Text begins with INT./EXT. → scene heading
+    * Rows where Talker is empty → stage direction, wrapped in [ ]
+    * Rows with a Talker → dialogue line; format as  "TALKER: dialogue"
+      - Strip inline VO cues after "//"  (e.g.  "//VO: phone call")
+      - Use JB PASS column when use_jb_pass=True *and* the cell is non-empty
+    """
+    import re as _re
+
+    def _clean_dialogue(raw: str) -> str:
+        """Remove //VO: and //TB: director / translator notes from a line."""
+        return _re.split(r"//(?:VO|TB|ALT)\s*:", raw, maxsplit=1)[0].strip()
+
+    lines: list[str] = []
+    current_scene: str = ""
+
+    for row in rows:
+        scene_id = str(row.get("SceneID") or "").strip()
+        talker   = str(row.get("Talker")  or "").strip()
+        text     = str(row.get("Text")    or "").strip()
+        jb       = str(row.get("JB PASS") or "").strip()
+
+        if not text and not talker:
+            continue                                       # truly blank row
+
+        # ── system / meta markers ──────────────────────────────────────────
+        if text.startswith("?") or text.startswith("<"):
+            continue
+
+        # ── visual separator lines ─────────────────────────────────────────
+        if not text.replace("-", "").strip():
+            continue
+
+        # ── scene break ───────────────────────────────────────────────────
+        if scene_id and scene_id != current_scene:
+            current_scene = scene_id
+            lines.append(f"\n{'─'*60}\n[{scene_id}]")
+
+        # ── stage direction / scene heading ───────────────────────────────
+        if not talker:
+            # Strip translator/technical notes from stage directions too
+            clean_text = _re.split(r"//(?:TB|VO|ALT)\s*:", text, maxsplit=1)[0].strip()
+            if not clean_text:
+                continue
+            if clean_text.startswith(("INT.", "EXT.")):
+                lines.append(f"\n{clean_text}")
+            else:
+                lines.append(f"  [{clean_text}]")
+            continue
+
+        # ── dialogue line ─────────────────────────────────────────────────
+        dialogue = jb if (use_jb_pass and jb) else text
+        dialogue = _clean_dialogue(dialogue)
+        lines.append(f"{talker}: {dialogue}")
+
+    return "\n".join(lines)
+
+
+def extract_csv_script(file, use_jb_pass: bool = False) -> tuple[str, bool]:
+    """
+    Parse an uploaded CSV file.  If it looks like a SEGA script table
+    (contains SceneID / Talker / Text headers) run extract_script_table;
+    otherwise fall back to a plain UTF-8 decode.
+
+    Returns (text, has_jb_pass) where has_jb_pass signals the UI should
+    offer the JB PASS toggle.
+    """
+    import io as _io, csv as _csv
+
+    raw = file.read()
+    if isinstance(raw, bytes):
+        # Try common encodings in order; script files from Windows tools are
+        # often saved as cp1252 (which encodes em-dashes, curly quotes, etc.)
+        for _enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+            try:
+                raw = raw.decode(_enc); break
+            except (UnicodeDecodeError, AttributeError):
+                continue
+        else:
+            raw = raw.decode("utf-8", errors="replace")
+
+    reader = _csv.DictReader(_io.StringIO(raw))
+    headers = reader.fieldnames or []
+    has_jb  = "JB PASS" in headers
+
+    if _is_script_table(headers):
+        return extract_script_table(list(reader), use_jb_pass=use_jb_pass), has_jb
+
+    # Plain CSV fallback
+    _io_obj = _io.StringIO(raw)
+    return _io_obj.read(), False
+
+
+def extract_xlsx_script(file, use_jb_pass: bool = False) -> tuple[str, bool]:
+    """
+    Parse an uploaded XLSX file.  If the first sheet matches the SEGA script
+    table format, run extract_script_table; otherwise fall back to the raw
+    tab-dump used previously.
+
+    Returns (text, has_jb_pass).
+    """
+    if not HAS_OPENPYXL:
+        return "[openpyxl not installed — run: pip install openpyxl]", False
+    try:
+        wb = openpyxl.load_workbook(file, data_only=True, read_only=True)
+        ws = wb[wb.sheetnames[0]]
+        rows_iter  = ws.iter_rows(values_only=True)
+        header_row = next(rows_iter, None)
+        if header_row is None:
+            return "", False
+        headers = [str(h).strip() if h is not None else "" for h in header_row]
+        has_jb  = "JB PASS" in headers
+
+        if _is_script_table(headers):
+            row_dicts = [
+                {headers[i]: (str(v).strip() if v is not None else "")
+                 for i, v in enumerate(row)}
+                for row in rows_iter
+            ]
+            return extract_script_table(row_dicts, use_jb_pass=use_jb_pass), has_jb
+
+        # ── raw dump fallback (non-script XLSX) ───────────────────────────
+        # Re-open because we already consumed the iterator
+        wb2   = openpyxl.load_workbook(file, data_only=True, read_only=True)
+        parts = []
+        for sheet_name in wb2.sheetnames:
+            parts.append(f"=== Sheet: {sheet_name} ===")
+            for row in wb2[sheet_name].iter_rows(values_only=True):
+                row_str = "\t".join(str(c) if c is not None else "" for c in row).rstrip()
+                if row_str.strip():
+                    parts.append(row_str)
+        return "\n".join(parts), False
+    except Exception as exc:
+        return f"[XLSX extraction error: {exc}]", False
+
+
 def get_severity_badge(severity: str) -> str:
     s = (severity or "info").lower().strip()
     if s in ("critical","hard","high","red"):   return '<span class="sev-c">CRITICAL</span>'
@@ -737,11 +901,35 @@ with tab_upload:
     if _missing:
         st.caption(f"⚠️ Optional packages not installed: {', '.join(_missing)}")
     uploaded = st.file_uploader(
-        "Upload .txt, .pdf, .docx, or .xlsx",
-        type=["txt", "pdf", "docx", "xlsx"],
+        "Upload .txt, .pdf, .docx, .xlsx, or .csv",
+        type=["txt", "pdf", "docx", "xlsx", "csv"],
     )
     if uploaded is not None:
         fname = uploaded.name.lower()
+
+        # ── JB PASS toggle (shown before extraction so it gates the parse) ──
+        # We need to peek at headers without consuming the buffer, so we do a
+        # lightweight pre-check for CSV/XLSX before the full parse.
+        _show_jb_toggle = False
+        if fname.endswith((".csv", ".xlsx")):
+            import io as _io, csv as _csv
+            _preview = uploaded.read(4096)
+            uploaded.seek(0)          # reset for the real read below
+            if isinstance(_preview, bytes):
+                _preview = _preview.decode("utf-8", errors="replace")
+            _first_line = _preview.splitlines()[0] if _preview else ""
+            if "JB PASS" in _first_line:
+                _show_jb_toggle = True
+
+        use_jb = False
+        if _show_jb_toggle:
+            use_jb = st.toggle(
+                "Use **JB PASS** column (editorial revisions)",
+                value=False,
+                help="When on, dialogue is taken from the 'JB PASS' column instead of "
+                     "'Text'. Lines without a JB PASS entry keep the original text.",
+            )
+
         if fname.endswith(".pdf") and HAS_PYPDF:
             script_text = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(uploaded).pages)
         elif fname.endswith(".pdf"):
@@ -750,9 +938,16 @@ with tab_upload:
         elif fname.endswith(".docx"):
             script_text = extract_docx_text(uploaded)
         elif fname.endswith(".xlsx"):
-            script_text = extract_xlsx_text(uploaded)
+            script_text, _has_jb = extract_xlsx_script(uploaded, use_jb_pass=use_jb)
+        elif fname.endswith(".csv"):
+            script_text, _has_jb = extract_csv_script(uploaded, use_jb_pass=use_jb)
         else:
             script_text = uploaded.read().decode("utf-8", errors="replace")
+
+        if fname.endswith((".csv", ".xlsx")) and _show_jb_toggle:
+            col_label = "JB PASS" if use_jb else "Text"
+            st.caption(f"📄 Extracted using **{col_label}** column — toggle above to switch")
+
         st.text_area("Extracted (editable)", script_text, height=320, key="si_upload")
 st.markdown("</div>", unsafe_allow_html=True)
 
