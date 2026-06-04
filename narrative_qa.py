@@ -27,6 +27,16 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
+try:
+    from docx import Document as DocxDocument; HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+try:
+    import openpyxl; HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
 st.set_page_config(page_title="SNAKE Narrative QA", page_icon="\U0001F40D",
                     layout="wide", initial_sidebar_state="expanded")
 
@@ -218,7 +228,7 @@ def parse_llm_json(raw: str) -> Any:
     if m:
         try: return json.loads(m.group(1))
         except Exception: pass
-    for co, cc in [("[", "]"), ("{", "}")]:
+    for co, cc in [("{", "}"), ("[", "]")]:
         idx = raw.find(co)
         if idx != -1:
             d = 0
@@ -229,6 +239,48 @@ def parse_llm_json(raw: str) -> Any:
                     try: return json.loads(raw[idx:i+1])
                     except Exception: break
     return {"raw_text": raw, "parse_error": True}
+
+
+def extract_docx_text(file) -> str:
+    """Extract plain text from a .docx file using python-docx."""
+    if not HAS_DOCX:
+        return "[python-docx not installed — run: pip install python-docx]"
+    try:
+        doc = DocxDocument(file)
+        parts = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                parts.append(para.text)
+        # Also pull text from tables
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = "	".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    parts.append(row_text)
+        return "\n".join(parts)
+    except Exception as exc:
+        return f"[DOCX extraction error: {exc}]"
+
+
+def extract_xlsx_text(file) -> str:
+    """Extract sheet contents from an .xlsx file using openpyxl."""
+    if not HAS_OPENPYXL:
+        return "[openpyxl not installed — run: pip install openpyxl]"
+    try:
+        wb = openpyxl.load_workbook(file, data_only=True, read_only=True)
+        parts = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            parts.append(f"=== Sheet: {sheet_name} ===")
+            for row in ws.iter_rows(values_only=True):
+                row_str = "	".join(
+                    str(cell) if cell is not None else "" for cell in row
+                ).rstrip()
+                if row_str.strip():
+                    parts.append(row_str)
+        return "\n".join(parts)
+    except Exception as exc:
+        return f"[XLSX extraction error: {exc}]"
 
 
 def get_severity_badge(severity: str) -> str:
@@ -307,7 +359,7 @@ def _check_auth() -> bool:
     return False
 
 def _render_login():
-    st.markdown('<div style="display:flex;justify-content:center;padding-top:10vh;">', unsafe_allow_html=True)
+    st.markdown('<div style="display:flex;justify-content:center;align-items:center;min-height:70vh;">', unsafe_allow_html=True)
     _, col_c, _ = st.columns([1, 2, 1])
     with col_c:
         st.markdown(
@@ -658,10 +710,27 @@ with tab_paste:
     default_val = SAMPLE_SCRIPTS.get(sample_choice, "")
     script_text = st.text_area("Paste script", value=default_val, height=320, key="si_paste")
 with tab_upload:
-    uploaded = st.file_uploader("Upload .txt or .pdf", type=["txt","pdf"])
+    _missing = []
+    if not HAS_PYPDF:    _missing.append("pypdf (for PDF)")
+    if not HAS_DOCX:     _missing.append("python-docx (for DOCX)")
+    if not HAS_OPENPYXL: _missing.append("openpyxl (for XLSX)")
+    if _missing:
+        st.caption(f"⚠️ Optional packages not installed: {', '.join(_missing)}")
+    uploaded = st.file_uploader(
+        "Upload .txt, .pdf, .docx, or .xlsx",
+        type=["txt", "pdf", "docx", "xlsx"],
+    )
     if uploaded is not None:
-        if uploaded.name.endswith(".pdf") and HAS_PYPDF:
+        fname = uploaded.name.lower()
+        if fname.endswith(".pdf") and HAS_PYPDF:
             script_text = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(uploaded).pages)
+        elif fname.endswith(".pdf"):
+            st.warning("pypdf is not installed; falling back to raw read. Install with: pip install pypdf")
+            script_text = uploaded.read().decode("utf-8", errors="replace")
+        elif fname.endswith(".docx"):
+            script_text = extract_docx_text(uploaded)
+        elif fname.endswith(".xlsx"):
+            script_text = extract_xlsx_text(uploaded)
         else:
             script_text = uploaded.read().decode("utf-8", errors="replace")
         st.text_area("Extracted (editable)", script_text, height=320, key="si_upload")
@@ -704,13 +773,19 @@ if script_text.strip():
             ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
             key = AGENT_META[agent_name]["key"]
             ar[key] = runner()
-            statuses[agent_name] = "complete" if not ar[key].get("parse_error") else "error"
+            _res = ar[key]
+            statuses[agent_name] = (
+                "complete" if isinstance(_res, dict) and not _res.get("parse_error") else "error"
+            )
             ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
 
         statuses["Arbiter"] = "running"
         ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
         ar["arbiter"] = run_arbiter(client, model_choice, ar, temperature)
-        statuses["Arbiter"] = "complete" if not ar["arbiter"].get("parse_error") else "error"
+        _arb = ar["arbiter"]
+        statuses["Arbiter"] = (
+            "complete" if isinstance(_arb, dict) and not _arb.get("parse_error") else "error"
+        )
         ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
 
         st.session_state["results"] = ar
