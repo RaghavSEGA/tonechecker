@@ -359,7 +359,18 @@ def _check_auth() -> bool:
     return False
 
 def _render_login():
-    st.markdown('<div style="display:flex;justify-content:center;align-items:center;min-height:70vh;">', unsafe_allow_html=True)
+    # Inject CSS so the block container is vertically centered.
+    # The old approach of wrapping st.columns in an opening/closing st.markdown div
+    # does not work — Streamlit renders each st.markdown as a sibling element, not a
+    # wrapper, so the div just became a blank 70 vh block sitting above the form.
+    st.markdown("""
+    <style>
+    .block-container {
+        padding-top: calc(50vh - 220px) !important;
+        padding-bottom: 2rem !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     _, col_c, _ = st.columns([1, 2, 1])
     with col_c:
         st.markdown(
@@ -399,7 +410,6 @@ def _render_login():
                     st.session_state["otp_attempts"] = att + 1
                     rem = MAX_OTP_ATTEMPTS - st.session_state["otp_attempts"]
                     st.error(f"Incorrect code. {rem} attempt{'s' if rem!=1 else ''} left.")
-    st.markdown("</div>", unsafe_allow_html=True)
 
 # ── auth gate ───────────────────────────────────────────────────────────────
 if not _check_auth():
