@@ -222,11 +222,21 @@ def detect_characters(script: str) -> list[str]:
 
 def parse_llm_json(raw: str) -> Any:
     raw = raw.strip()
-    try: return json.loads(raw)
+
+    def _ensure_dict(obj: Any) -> Any:
+        """Unwrap a single-element list that wraps a dict (e.g. [{...}] -> {...}).
+        Any other list is treated as a parse failure so callers always get a dict."""
+        if isinstance(obj, list):
+            if len(obj) == 1 and isinstance(obj[0], dict):
+                return obj[0]
+            return {"raw_text": raw, "parse_error": True}
+        return obj
+
+    try: return _ensure_dict(json.loads(raw))
     except Exception: pass
     m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", raw, re.S)
     if m:
-        try: return json.loads(m.group(1))
+        try: return _ensure_dict(json.loads(m.group(1)))
         except Exception: pass
     for co, cc in [("{", "}"), ("[", "]")]:
         idx = raw.find(co)
@@ -236,7 +246,7 @@ def parse_llm_json(raw: str) -> Any:
                 if raw[i] == co: d += 1
                 elif raw[i] == cc: d -= 1
                 if d == 0:
-                    try: return json.loads(raw[idx:i+1])
+                    try: return _ensure_dict(json.loads(raw[idx:i+1]))
                     except Exception: break
     return {"raw_text": raw, "parse_error": True}
 
@@ -801,20 +811,28 @@ if script_text.strip():
         st.session_state["results"] = ar
         st.session_state["result_script"] = script_text
         st.session_state["result_characters"] = characters
+        _arb_hist = ar.get("arbiter", {})
+        if not isinstance(_arb_hist, dict):
+            _arb_hist = {}
         st.session_state.setdefault("history", []).append({
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "score": ar.get("arbiter",{}).get("overall_score","?"),
+            "score": _arb_hist.get("overall_score", "?"),
             "characters": characters})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RESULTS DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
+def _safe_dict(v: Any) -> dict:
+    """Return v if it is a dict, else an empty dict. Guards against the LLM
+    returning a JSON array instead of an object."""
+    return v if isinstance(v, dict) else {}
+
 if "results" in st.session_state:
     res = st.session_state["results"]
-    vk = res.get("voice_keeper",{}); lw = res.get("lore_warden",{})
-    ds = res.get("dialect_sentinel",{}); tc = res.get("tone_cartographer",{})
-    arb = res.get("arbiter",{}); chars = st.session_state.get("result_characters",[])
+    vk = _safe_dict(res.get("voice_keeper")); lw = _safe_dict(res.get("lore_warden"))
+    ds = _safe_dict(res.get("dialect_sentinel")); tc = _safe_dict(res.get("tone_cartographer"))
+    arb = _safe_dict(res.get("arbiter")); chars = st.session_state.get("result_characters",[])
     scr = st.session_state.get("result_script","")
 
     st.divider()
