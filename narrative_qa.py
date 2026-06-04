@@ -613,7 +613,7 @@ def get_client():
 def call_agent(client, model: str, system_prompt: str, user_prompt: str,
                temperature: float = 0.15) -> str:
     try:
-        resp = client.messages.create(model=model, max_tokens=4096,
+        resp = client.messages.create(model=model, max_tokens=8192,
             temperature=temperature, system=system_prompt,
             messages=[{"role":"user","content":user_prompt}])
         return resp.content[0].text
@@ -631,32 +631,37 @@ _VK_SYS = """\
 You are VOICE KEEPER for the game SNAKE. Check every dialogue line against CHARACTER PROFILES.
 Check: vocabulary fingerprint, sentence-construction, emotional register, code-switching, tonal arc.
 RULES: nobody speaks in exposition; profanity is earned; speech rhythms are NOT interchangeable; avoid over-explanation, self-pity, clich\u00e9.
-OUTPUT valid JSON ONLY:
+Report the most impactful issues only — maximum 25, prioritised by severity.
+OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
 {"voice_score":<0-100>,"issues":[{"line_number":<int>,"line_text":"<exact>","character":"<NAME>","issue_type":"<vocabulary_deviation|register_mismatch|emotional_register|code_switching|tonal_arc|exposition>","severity":"<critical|warning|info>","explanation":"<2-3 sent>","direction":"<suggestion, do NOT rewrite>"}]}"""
 
 _LW_SYS = """\
 You are LORE WARDEN for SNAKE. Identify any contradiction with established canon, world rules, character histories or timeline.
 Check: factual contradictions, timeline violations, world-rule violations, character knowledge state, relationship state, absent character references.
-OUTPUT valid JSON ONLY:
+Report the most impactful issues only — maximum 25, prioritised by severity.
+OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
 {"lore_score":<0-100>,"issues":[{"line_number":<int>,"line_text":"<exact>","issue_type":"<factual_contradiction|timeline_violation|world_rule|knowledge_state|relationship_state|absent_character>","severity":"<critical|warning|info>","explanation":"<2-3 sent>","resolution_options":"<fixes>"}]}"""
 
 _DS_SYS = """\
 You are DIALECT SENTINEL for SNAKE. Protect linguistic texture.
 Check: faction/region slang, idiom coherence (no real-world idioms that break setting), profanity-system integrity, politeness markers, cultural register, regional Spanish (Cielo = Paraguayan).
-OUTPUT valid JSON ONLY:
+Report the most impactful issues only — maximum 25, prioritised by severity.
+OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
 {"dialect_score":<0-100>,"issues":[{"line_number":<int>,"line_text":"<exact>","character":"<NAME>","issue_type":"<slang_inconsistency|idiom_violation|profanity_misuse|formality_error|cultural_register|language_variant>","severity":"<critical|warning|info>","explanation":"<2-3 sent>","suggestion":"<direction>"}]}"""
 
 _TC_SYS = """\
 You are TONE CARTOGRAPHER for SNAKE. Analyse scene-level emotional trajectory.
 Check: tonal whiplash, escalation/de-escalation curves, thematic consistency, clich\u00e9s, pacing.
-OUTPUT valid JSON ONLY:
+Report the most impactful issues only — maximum 25, prioritised by severity.
+OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
 {"tone_score":<0-100>,"tone_map":[{"scene_segment":"<beat>","tone_description":"<e.g. restrained tension>","intended_effect":"<player feeling>"}],"issues":[{"scene_segment":"<part>","issue_type":"<tonal_whiplash|flat_escalation|thematic_inconsistency|cliche|pacing>","severity":"<critical|warning|info>","explanation":"<2-3 sent>"}]}"""
 
 _ARB_SYS = """\
 You are ARBITER for SNAKE narrative QA. You receive outputs from Voice Keeper, Lore Warden, Dialect Sentinel, Tone Cartographer.
 1. Merge & deduplicate overlapping flags.  2. Rank by severity & narrative impact.
 3. Identify cross-agent conflicts.  4. Detect patterns (character flagged repeatedly = possible intentional evolution).
-OUTPUT valid JSON ONLY:
+Top 20 items in priority_list maximum.
+OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
 {"overall_score":<0-100>,"critical_count":<int>,"warning_count":<int>,"info_count":<int>,
 "priority_list":[{"rank":<int>,"agent_source":"<name>","severity":"<lvl>","summary":"<1 sent>","recommendation":"<action>"}],
 "narrative_health_summary":"<2-3 paragraph assessment>",
