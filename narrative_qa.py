@@ -8,6 +8,7 @@ Two separate AWS credential sets:
 from __future__ import annotations
 import streamlit as st
 import json, re, hashlib, hmac, time, os, io, csv, textwrap, random, base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -375,10 +376,15 @@ def _is_script_table(headers: list[str]) -> bool:
     return _SCRIPT_COLS.issubset(normed)
 
 
-def extract_script_table(rows: list[dict], use_jb_pass: bool = False) -> str:
+def extract_script_table(rows: list[dict], use_jb_pass: bool = False) -> tuple[str, dict[int, int]]:
     """
     Convert a list of row-dicts (keyed by column header) from a SEGA script
     sheet into a clean script string suitable for NQA analysis.
+
+    Returns (text, line_map) where line_map maps each 1-based output line
+    number to the 0-based ordinal of the source data row it came from
+    (synthetic lines such as scene separators have no entry). The map is what
+    lets analysis results be written back into the original spreadsheet.
 
     Column semantics
     ----------------
@@ -405,10 +411,15 @@ def extract_script_table(rows: list[dict], use_jb_pass: bool = False) -> str:
         """Remove //VO: and //TB: director / translator notes from a line."""
         return _re.split(r"//(?:VO|TB|ALT)\s*:", raw, maxsplit=1)[0].strip()
 
-    lines: list[str] = []
+    out:  list[str]        = []
+    srcs: list[int | None] = []          # parallel: source row ordinal per line
+
+    def _emit(line: str, source: int | None = None):
+        out.append(line); srcs.append(source)
+
     current_scene: str = ""
 
-    for row in rows:
+    for ridx, row in enumerate(rows):
         scene_id = str(row.get("SceneID") or "").strip()
         talker   = str(row.get("Talker")  or "").strip()
         text     = str(row.get("Text")    or "").strip()
@@ -417,47 +428,45 @@ def extract_script_table(rows: list[dict], use_jb_pass: bool = False) -> str:
         if not text and not talker:
             continue                                       # truly blank row
 
-        # ── system / meta markers ──────────────────────────────────────────
+        # ── system / meta markers ──
         if text.startswith("?") or text.startswith("<"):
             continue
 
-        # ── visual separator lines ─────────────────────────────────────────
+        # ── visual separator lines ──
         if not text.replace("-", "").strip():
             continue
 
-        # ── scene break ───────────────────────────────────────────────────
+        # ── scene break ──
         if scene_id and scene_id != current_scene:
             current_scene = scene_id
-            lines.append(f"\n{'─'*60}\n[{scene_id}]")
+            _emit(""); _emit("─" * 60); _emit(f"[{scene_id}]")
 
-        # ── stage direction / scene heading ───────────────────────────────
+        # ── stage direction / scene heading ──
         if not talker:
-            # Strip translator/technical notes from stage directions too
             clean_text = _re.split(r"//(?:TB|VO|ALT)\s*:", text, maxsplit=1)[0].strip()
             if not clean_text:
                 continue
             if clean_text.startswith(("INT.", "EXT.")):
-                lines.append(f"\n{clean_text}")
+                _emit(""); _emit(clean_text, ridx)
             else:
-                lines.append(f"  [{clean_text}]")
+                _emit(f"  [{clean_text}]", ridx)
             continue
 
-        # ── dialogue line ─────────────────────────────────────────────────
+        # ── dialogue line ──
         dialogue = jb if (use_jb_pass and jb) else text
-        dialogue = _clean_dialogue(dialogue)
-        lines.append(f"{talker}: {dialogue}")
+        _emit(f"{talker}: {_clean_dialogue(dialogue)}", ridx)
 
-    return "\n".join(lines)
+    line_map = {i + 1: s for i, s in enumerate(srcs) if s is not None}
+    return "\n".join(out), line_map
 
 
-def extract_csv_script(file, use_jb_pass: bool = False) -> tuple[str, bool]:
+def extract_csv_script(file, use_jb_pass: bool = False) -> tuple[str, bool, dict[int, int]]:
     """
-    Parse an uploaded CSV file.  If it looks like a SEGA script table
+    Parse an uploaded CSV file. If it looks like a SEGA script table
     (contains SceneID / Talker / Text headers) run extract_script_table;
     otherwise fall back to a plain UTF-8 decode.
 
-    Returns (text, has_jb_pass) where has_jb_pass signals the UI should
-    offer the JB PASS toggle.
+    Returns (text, has_jb_pass, line_map). line_map is empty for plain CSVs.
     """
     import io as _io, csv as _csv
 
@@ -478,30 +487,30 @@ def extract_csv_script(file, use_jb_pass: bool = False) -> tuple[str, bool]:
     has_jb  = "JB PASS" in headers
 
     if _is_script_table(headers):
-        return extract_script_table(list(reader), use_jb_pass=use_jb_pass), has_jb
+        text, line_map = extract_script_table(list(reader), use_jb_pass=use_jb_pass)
+        return text, has_jb, line_map
 
     # Plain CSV fallback
-    _io_obj = _io.StringIO(raw)
-    return _io_obj.read(), False
+    return raw, False, {}
 
 
-def extract_xlsx_script(file, use_jb_pass: bool = False) -> tuple[str, bool]:
+def extract_xlsx_script(file, use_jb_pass: bool = False) -> tuple[str, bool, dict[int, int]]:
     """
-    Parse an uploaded XLSX file.  If the first sheet matches the SEGA script
-    table format, run extract_script_table; otherwise fall back to the raw
-    tab-dump used previously.
+    Parse an uploaded XLSX file. If the first sheet matches the SEGA script
+    table format, run extract_script_table; otherwise fall back to a raw
+    tab-dump.
 
-    Returns (text, has_jb_pass).
+    Returns (text, has_jb_pass, line_map). line_map is empty in fallback mode.
     """
     if not HAS_OPENPYXL:
-        return "[openpyxl not installed — run: pip install openpyxl]", False
+        return "[openpyxl not installed — run: pip install openpyxl]", False, {}
     try:
         wb = openpyxl.load_workbook(file, data_only=True, read_only=True)
         ws = wb[wb.sheetnames[0]]
         rows_iter  = ws.iter_rows(values_only=True)
         header_row = next(rows_iter, None)
         if header_row is None:
-            return "", False
+            return "", False, {}
         headers = [str(h).strip() if h is not None else "" for h in header_row]
         has_jb  = "JB PASS" in headers
 
@@ -511,10 +520,11 @@ def extract_xlsx_script(file, use_jb_pass: bool = False) -> tuple[str, bool]:
                  for i, v in enumerate(row)}
                 for row in rows_iter
             ]
-            return extract_script_table(row_dicts, use_jb_pass=use_jb_pass), has_jb
+            text, line_map = extract_script_table(row_dicts, use_jb_pass=use_jb_pass)
+            return text, has_jb, line_map
 
-        # ── raw dump fallback (non-script XLSX) ───────────────────────────
-        # Re-open because we already consumed the iterator
+        # ── raw dump fallback (non-script XLSX) ──
+        file.seek(0)
         wb2   = openpyxl.load_workbook(file, data_only=True, read_only=True)
         parts = []
         for sheet_name in wb2.sheetnames:
@@ -523,9 +533,9 @@ def extract_xlsx_script(file, use_jb_pass: bool = False) -> tuple[str, bool]:
                 row_str = "\t".join(str(c) if c is not None else "" for c in row).rstrip()
                 if row_str.strip():
                     parts.append(row_str)
-        return "\n".join(parts), False
+        return "\n".join(parts), False, {}
     except Exception as exc:
-        return f"[XLSX extraction error: {exc}]", False
+        return f"[XLSX extraction error: {exc}]", False, {}
 
 
 def get_severity_badge(severity: str) -> str:
@@ -730,13 +740,30 @@ def get_client():
     return None
 
 def call_agent(client, model: str, system_prompt: str, user_prompt: str,
-               temperature: float = 0.15) -> str:
+               temperature: float = 0.15, cache_system: bool = False) -> str:
+    """Invoke the model. When cache_system=True the system prompt is marked
+    with cache_control so identical prefixes (style guide + profiles + script)
+    are cached across the four agents and across re-runs within the cache TTL,
+    cutting input cost ~90% on hits. Falls back to an uncached call if the
+    region/SDK rejects cache_control."""
+    sys_param: Any = system_prompt
+    if cache_system:
+        sys_param = [{"type": "text", "text": system_prompt,
+                      "cache_control": {"type": "ephemeral"}}]
     try:
         resp = client.messages.create(model=model, max_tokens=8192,
-            temperature=temperature, system=system_prompt,
-            messages=[{"role":"user","content":user_prompt}])
+            temperature=temperature, system=sys_param,
+            messages=[{"role": "user", "content": user_prompt}])
         return resp.content[0].text
     except Exception as exc:
+        if cache_system:
+            try:    # cache_control unsupported here → plain retry
+                resp = client.messages.create(model=model, max_tokens=8192,
+                    temperature=temperature, system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}])
+                return resp.content[0].text
+            except Exception as exc2:
+                return json.dumps({"error": str(exc2)})
         return json.dumps({"error": str(exc)})
 
 def relevant_profiles(characters: list[str]) -> str:
@@ -800,33 +827,40 @@ def _numbered_script(script: str) -> str:
     verifiable line references."""
     return "\n".join(f"{i:>4} | {l}" for i, l in enumerate(script.split("\n"), 1))
 
-def _build_user_prompt(script: str, characters: list[str]) -> str:
-    return (f"## STYLE GUIDE\n{STYLE_GUIDE_TEXT}\n\n"
+def _shared_system(script: str, characters: list[str]) -> str:
+    """Context shared verbatim by all four line agents. Kept identical (and
+    placed in the system block with cache_control) so one cache entry serves
+    every agent call for this script."""
+    return ("You are one of several specialised narrative-QA agents for the game SNAKE. "
+            "Your specific role and output schema follow in the user message.\n\n"
+            f"## STYLE GUIDE\n{STYLE_GUIDE_TEXT}\n\n"
             f"## DETECTED CHARACTER PROFILES\n{relevant_profiles(characters)}\n\n"
-            f"## SCRIPT TO ANALYSE\n"
-            f"Each line is prefixed with its line number and ' | '.\n"
+            "## SCRIPT TO ANALYSE\n"
+            "Each line is prefixed with its line number and ' | '.\n"
             f"```\n{_numbered_script(script)}\n```\n\n"
             "When reporting an issue: line_number MUST be the numeric prefix of the "
             "flagged line exactly as shown; line_text MUST be the exact text AFTER "
             "the ' | ' separator (never include the number prefix); flagged_phrase "
-            "MUST be copied verbatim from within line_text.\n"
-            "Return ONLY valid JSON matching your schema.")
+            "MUST be copied verbatim from within line_text.")
+
+def _run_line_agent(client, model, role_prompt, script, characters, temp):
+    return parse_llm_json(call_agent(
+        client, model,
+        _shared_system(script, characters),                 # cached prefix
+        role_prompt + "\n\nReturn ONLY valid JSON matching your schema.",
+        temp, cache_system=True))
 
 def run_voice_keeper(client, model, script, characters, temp):
-    return parse_llm_json(call_agent(client, model, _VK_SYS,
-                                     _build_user_prompt(script, characters), temp))
+    return _run_line_agent(client, model, _VK_SYS, script, characters, temp)
 
 def run_lore_warden(client, model, script, characters, temp):
-    return parse_llm_json(call_agent(client, model, _LW_SYS,
-                                     _build_user_prompt(script, characters), temp))
+    return _run_line_agent(client, model, _LW_SYS, script, characters, temp)
 
 def run_dialect_sentinel(client, model, script, characters, temp):
-    return parse_llm_json(call_agent(client, model, _DS_SYS,
-                                     _build_user_prompt(script, characters), temp))
+    return _run_line_agent(client, model, _DS_SYS, script, characters, temp)
 
 def run_tone_cartographer(client, model, script, characters, temp):
-    return parse_llm_json(call_agent(client, model, _TC_SYS,
-                                     _build_user_prompt(script, characters), temp))
+    return _run_line_agent(client, model, _TC_SYS, script, characters, temp)
 
 def run_arbiter(client, model, agent_results: dict, temp):
     prompt = (f"## AGENT OUTPUTS\n```json\n{json.dumps(agent_results, indent=2, default=str)}\n```\n\n"
@@ -941,7 +975,38 @@ def _attach_issues_to_lines(lines: list[str], all_iss: list[dict]):
             unmatched.append(iss)
     return lm, unmatched
 
+def _sev_bucket(s: str) -> str:
+    s = (s or "").lower()
+    if s in ("critical", "hard", "high"):   return "Critical"
+    if s in ("warning", "medium", "soft"):  return "Warning"
+    return "Info"
+
 def render_annotated_script(script: str, results: dict):
+    all_iss = _collect_all_issues(results)
+
+    # ── filter bar ──────────────────────────────────────────────────────────
+    agents_present = sorted({i.get("_agent", "") for i in all_iss if i.get("_agent")})
+    agent_labels = {a: a.replace("_", " ").title() for a in agents_present}
+    fc1, fc2, fc3 = st.columns([1.3, 1.7, 2.4])
+    with fc1:
+        only_flagged = st.toggle("Flagged lines only", value=False, key="as_only_flagged",
+                                 help="Hide clean lines and show just the flagged ones with a line of context.")
+    with fc2:
+        sev_sel = st.multiselect("Severity", ["Critical", "Warning", "Info"],
+                                 default=["Critical", "Warning", "Info"], key="as_sev")
+    with fc3:
+        ag_sel = st.multiselect("Agent", agents_present,
+                                default=agents_present,
+                                format_func=lambda a: agent_labels.get(a, a), key="as_agent")
+
+    # apply filters
+    filt = [i for i in all_iss
+            if _sev_bucket(i.get("severity")) in (sev_sel or ["Critical", "Warning", "Info"])
+            and (i.get("_agent") in ag_sel if ag_sel else True)]
+    n_hidden = len(all_iss) - len(filt)
+    if n_hidden:
+        st.caption(f"{len(filt)} issue{'s' if len(filt) != 1 else ''} shown \u00B7 {n_hidden} hidden by filters")
+
     # legend
     leg = " ".join(
         f'<span class="ag-chip" style="background:{c}22;color:{c};border:1px solid {c}66;">'
@@ -958,9 +1023,8 @@ def render_annotated_script(script: str, results: dict):
         f'highlighted text = flagged phrase</span></div>',
         unsafe_allow_html=True)
 
-    all_iss = _collect_all_issues(results)
     lines = script.split("\n")
-    lm, unmatched = _attach_issues_to_lines(lines, all_iss)
+    lm, unmatched = _attach_issues_to_lines(lines, filt)
 
     SEV_RANK = {"critical": 0, "hard": 0, "high": 0,
                 "warning": 1, "medium": 1, "soft": 1}
@@ -978,10 +1042,11 @@ def render_annotated_script(script: str, results: dict):
                 + (f'<br/><em style="color:var(--blu);">\u27A4 {dr}</em>' if dr else "")
                 + "</div>")
 
-    hp = ['<div style="font-family:monospace;font-size:.88rem;line-height:1.6;">']
-    for idx, line in enumerate(lines, 1):
+    def _render_line(idx: int) -> list[str]:
+        line = lines[idx - 1]
         issues = sorted(lm.get(idx, []),
                         key=lambda i: SEV_RANK.get((i.get("severity") or "").lower(), 2))
+        out = []
         if issues:
             top = issues[0]
             w = {0: "critical", 1: "warning"}.get(
@@ -991,9 +1056,31 @@ def render_annotated_script(script: str, results: dict):
         else:
             cls = "aline al-ok" if line.strip() else "aline"
             sl = _esc(line)
-        hp.append(f'<div class="{cls}"><span style="color:#555;margin-right:8px;">{idx:>3}</span>{sl}</div>')
+        out.append(f'<div class="{cls}"><span style="color:#555;margin-right:8px;">{idx:>3}</span>{sl}</div>')
         for i in issues:
-            hp.append(_issue_note(i))
+            out.append(_issue_note(i))
+        return out
+
+    hp = ['<div style="font-family:monospace;font-size:.88rem;line-height:1.6;">']
+    if only_flagged:
+        if not lm:
+            hp.append('<div style="color:#667;padding:12px;">No flagged lines match the current filters.</div>')
+        else:
+            # flagged lines plus one line of context, with gap markers
+            visible: set[int] = set()
+            for ln in lm:
+                visible.update({ln - 1, ln, ln + 1})
+            visible = {v for v in visible if 1 <= v <= len(lines)}
+            prev = None
+            for idx in sorted(visible):
+                if prev is not None and idx > prev + 1:
+                    hp.append('<div style="color:#445;text-align:center;font-size:.8rem;'
+                              'padding:2px 0;">\u22EF</div>')
+                hp.extend(_render_line(idx))
+                prev = idx
+    else:
+        for idx in range(1, len(lines) + 1):
+            hp.extend(_render_line(idx))
     hp.append("</div>")
     st.markdown("".join(hp), unsafe_allow_html=True)
 
@@ -1072,6 +1159,93 @@ def render_character_reports(characters: list[str], results: dict):
                     f'<div style="color:#ccc;font-size:.85rem;margin-top:6px;">{ex}</div>'
                     + (f'<em style="color:var(--blu);font-size:.85rem;">\u27A4 {dr}</em>' if dr else "")
                     + "</div>", unsafe_allow_html=True)
+
+def _issues_by_source_row(script: str, results: dict, line_map: dict) -> dict[int, list[dict]]:
+    """Group attached issues by their ORIGINAL spreadsheet row ordinal using
+    the extraction line_map (output line number -> 0-based data-row index)."""
+    all_iss = _collect_all_issues(results)
+    lines = script.split("\n")
+    lm, _ = _attach_issues_to_lines(lines, all_iss)
+    by_row: dict[int, list[dict]] = {}
+    for ln, iss_list in lm.items():
+        ridx = line_map.get(ln) if isinstance(line_map, dict) else None
+        # JSON round-trips turn int keys into strings — accept both
+        if ridx is None and isinstance(line_map, dict):
+            ridx = line_map.get(str(ln))
+        if ridx is None:
+            continue
+        by_row.setdefault(int(ridx), []).extend(iss_list)
+    return by_row
+
+def _row_annotation(iss_list: list[dict]) -> tuple[str, str, str]:
+    """Collapse a row's issues into (worst severity, agent list, notes)."""
+    _order = {"Critical": 0, "Warning": 1, "Info": 2}
+    worst = min((_sev_bucket(i.get("severity")) for i in iss_list),
+                key=lambda b: _order[b])
+    agents = ", ".join(sorted({(i.get("_agent") or "").replace("_", " ").title()
+                               for i in iss_list if i.get("_agent")}))
+    notes = []
+    for i in iss_list:
+        ag = (i.get("_agent") or "").replace("_", " ").title()
+        ex = (i.get("explanation") or "").strip()
+        dr = (i.get("direction") or i.get("suggestion") or i.get("resolution_options") or "").strip()
+        note = f"[{_sev_bucket(i.get('severity'))}/{ag}] {ex}"
+        if dr:
+            note += f" \u27A4 {dr}"
+        notes.append(note)
+    return worst, agents, " | ".join(notes)
+
+_WB_HEADERS = ["NQA Severity", "NQA Agents", "NQA Note"]
+
+def build_writeback_csv(src_bytes: bytes, by_row: dict[int, list[dict]]) -> bytes:
+    """Return the original CSV with NQA columns appended, aligned by row."""
+    raw = src_bytes
+    if isinstance(raw, bytes):
+        for _enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+            try:
+                raw = raw.decode(_enc); break
+            except (UnicodeDecodeError, AttributeError):
+                continue
+        else:
+            raw = raw.decode("utf-8", errors="replace")
+    rows = list(csv.reader(io.StringIO(raw)))
+    if not rows:
+        return src_bytes
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]      # pad ragged rows
+    rows[0].extend(_WB_HEADERS)
+    for ridx, iss_list in by_row.items():
+        target = ridx + 1                                    # +1 skips header
+        if 1 <= target < len(rows):
+            rows[target].extend(_row_annotation(iss_list))
+    for i, r in enumerate(rows):
+        if len(r) < width + 3:
+            rows[i] = r + [""] * (width + 3 - len(r))
+    buf = io.StringIO()
+    csv.writer(buf).writerows(rows)
+    return buf.getvalue().encode("utf-8-sig")               # Excel-friendly BOM
+
+def build_writeback_xlsx(src_bytes: bytes, by_row: dict[int, list[dict]]) -> bytes | None:
+    """Return the original XLSX with NQA columns appended on the first sheet."""
+    if not HAS_OPENPYXL:
+        return None
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(src_bytes))
+        ws = wb[wb.sheetnames[0]]
+        base = ws.max_column
+        for off, h in enumerate(_WB_HEADERS, 1):
+            ws.cell(row=1, column=base + off, value=h)
+        for ridx, iss_list in by_row.items():
+            sev, agents, note = _row_annotation(iss_list)
+            target = ridx + 2                                # +1 header, +1 1-based
+            ws.cell(row=target, column=base + 1, value=sev)
+            ws.cell(row=target, column=base + 2, value=agents)
+            ws.cell(row=target, column=base + 3, value=note)
+        out = io.BytesIO()
+        wb.save(out)
+        return out.getvalue()
+    except Exception:
+        return None
 
 def build_csv_export(results: dict) -> str:
     buf = io.StringIO()
@@ -1231,11 +1405,20 @@ with tab_upload:
         elif fname.endswith(".docx"):
             script_text = extract_docx_text(uploaded)
         elif fname.endswith(".xlsx"):
-            script_text, _has_jb = extract_xlsx_script(uploaded, use_jb_pass=use_jb)
+            _src_bytes = uploaded.getvalue()
+            script_text, _has_jb, _line_map = extract_xlsx_script(uploaded, use_jb_pass=use_jb)
+            st.session_state["upload_source"] = {
+                "bytes": _src_bytes, "name": uploaded.name, "kind": "xlsx",
+                "line_map": _line_map, "extracted_text": script_text} if _line_map else None
         elif fname.endswith(".csv"):
-            script_text, _has_jb = extract_csv_script(uploaded, use_jb_pass=use_jb)
+            _src_bytes = uploaded.getvalue()
+            script_text, _has_jb, _line_map = extract_csv_script(uploaded, use_jb_pass=use_jb)
+            st.session_state["upload_source"] = {
+                "bytes": _src_bytes, "name": uploaded.name, "kind": "csv",
+                "line_map": _line_map, "extracted_text": script_text} if _line_map else None
         else:
             script_text = uploaded.read().decode("utf-8", errors="replace")
+            st.session_state["upload_source"] = None
 
         if fname.endswith((".csv", ".xlsx")) and _show_jb_toggle:
             col_label = "JB PASS" if use_jb else "Text"
@@ -1271,21 +1454,47 @@ if script_text.strip():
         ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
         ar: dict[str, Any] = {}
 
-        for agent_name, runner in [
-            ("Voice Keeper",      lambda: run_voice_keeper(client, model_choice, script_text, characters, temperature)),
-            ("Lore Warden",       lambda: run_lore_warden(client, model_choice, script_text, characters, temperature)),
-            ("Dialect Sentinel",  lambda: run_dialect_sentinel(client, model_choice, script_text, characters, temperature)),
-            ("Tone Cartographer", lambda: run_tone_cartographer(client, model_choice, script_text, characters, temperature)),
-        ]:
-            statuses[agent_name] = "running"
-            ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
+        _agent_fns = {
+            "Voice Keeper":      lambda: run_voice_keeper(client, model_choice, script_text, characters, temperature),
+            "Lore Warden":       lambda: run_lore_warden(client, model_choice, script_text, characters, temperature),
+            "Dialect Sentinel":  lambda: run_dialect_sentinel(client, model_choice, script_text, characters, temperature),
+            "Tone Cartographer": lambda: run_tone_cartographer(client, model_choice, script_text, characters, temperature),
+        }
+
+        def _record(agent_name: str, result):
             key = AGENT_META[agent_name]["key"]
-            ar[key] = runner()
-            _res = ar[key]
-            statuses[agent_name] = (
-                "complete" if isinstance(_res, dict) and not _res.get("parse_error") else "error"
-            )
+            if not isinstance(result, dict):
+                result = {"parse_error": True, "raw_text": str(result)}
+            ar[key] = result
+            statuses[agent_name] = "complete" if not result.get("parse_error") else "error"
             ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
+
+        # Staggered-parallel execution: the first agent runs alone so its call
+        # writes the prompt cache (shared system block); the remaining three
+        # then run concurrently and read that cache. Net effect vs serial:
+        # ~2x faster wall-clock and ~3 cached-input calls per run.
+        _names = list(_agent_fns)
+        statuses[_names[0]] = "running"
+        ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
+        try:
+            _first_res = _agent_fns[_names[0]]()
+        except Exception as _e:
+            _first_res = {"parse_error": True, "raw_text": str(_e)}
+        _record(_names[0], _first_res)
+
+        _rest = _names[1:]
+        for n in _rest:
+            statuses[n] = "running"
+        ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
+        with ThreadPoolExecutor(max_workers=3) as _ex:
+            _futs = {_ex.submit(_agent_fns[n]): n for n in _rest}
+            for _fut in as_completed(_futs):
+                _n = _futs[_fut]
+                try:
+                    _res = _fut.result()
+                except Exception as _e:
+                    _res = {"parse_error": True, "raw_text": str(_e)}
+                _record(_n, _res)
 
         statuses["Arbiter"] = "running"
         ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
@@ -1299,6 +1508,13 @@ if script_text.strip():
         st.session_state["results"] = ar
         st.session_state["result_script"] = script_text
         st.session_state["result_characters"] = characters
+        # keep the source-file mapping only if the analysed text is exactly
+        # what was extracted (edits invalidate row alignment)
+        _us = st.session_state.get("upload_source")
+        if _us and _us.get("extracted_text") == script_text:
+            st.session_state["result_source"] = _us
+        else:
+            st.session_state.pop("result_source", None)
         _arb_hist = ar.get("arbiter", {})
         if not isinstance(_arb_hist, dict):
             _arb_hist = {}
@@ -1417,12 +1633,39 @@ if "results" in st.session_state:
 
     with t5:
         st.markdown("### Download Analysis")
-        c1, c2, _ = st.columns([2,2,6])
+        c1, c2, c3, _ = st.columns([2, 2, 3, 3])
         c1.download_button("\u2B07 CSV", build_csv_export(res),
             file_name=f"snake_nqa_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv", use_container_width=True)
         c2.download_button("\u2B07 JSON", json.dumps(res, indent=2, default=str),
             file_name=f"snake_nqa_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
             mime="application/json", use_container_width=True)
+
+        _src = st.session_state.get("result_source")
+        if _src and _src.get("line_map"):
+            _by_row = _issues_by_source_row(scr, res, _src["line_map"])
+            _stem = os.path.splitext(_src["name"])[0]
+            if _src["kind"] == "csv":
+                _wb = build_writeback_csv(_src["bytes"], _by_row)
+                c3.download_button("\u2B07 Annotated source CSV", _wb,
+                    file_name=f"{_stem}_NQA.csv", mime="text/csv",
+                    use_container_width=True,
+                    help="Your original file with NQA Severity / Agents / Note "
+                         "columns appended to the flagged rows.")
+            else:
+                _wb = build_writeback_xlsx(_src["bytes"], _by_row)
+                if _wb:
+                    c3.download_button("\u2B07 Annotated source XLSX", _wb,
+                        file_name=f"{_stem}_NQA.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        help="Your original workbook with NQA Severity / Agents / Note "
+                             "columns appended to the flagged rows.")
+            st.caption(f"\U0001F4CE Write-back: {len(_by_row)} source row"
+                       f"{'s' if len(_by_row) != 1 else ''} annotated in {_src['name']}")
+        else:
+            st.caption("\U0001F4A1 Write-back export (your original CSV/XLSX with NQA columns "
+                       "added) is available when you analyse an uploaded script sheet without "
+                       "editing the extracted text.")
         with st.expander("Preview JSON"):
             st.json(res)
