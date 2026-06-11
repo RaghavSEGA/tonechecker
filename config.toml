@@ -1,0 +1,18 @@
+# SNAKE NQA — Streamlit theme
+# Place this file at:  .streamlit/config.toml  (relative to the repo root,
+# i.e. the directory you run `streamlit run` from).
+#
+# This drives the NATIVE styling of every Streamlit widget — dropdown popovers,
+# multiselect chips, sliders, toggles, focus rings — which page CSS cannot
+# fully reach. primaryColor replaces Streamlit's default red accent.
+
+[theme]
+base = "dark"
+primaryColor = "#00AADD"
+backgroundColor = "#040A1C"
+secondaryBackgroundColor = "#0D1B2A"
+textColor = "#E0E0E0"
+font = "sans serif"
+
+[server]
+maxUploadSize = 50
