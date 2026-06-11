@@ -81,6 +81,70 @@ textarea{background:var(--bg1)!important;color:var(--txt)!important;border:1px s
 .fl-i{background:rgba(0,170,221,.40);color:#fff;padding:0 3px;border-radius:3px;font-weight:600;}
 .line-quote{font-family:monospace;font-size:.8rem;background:rgba(255,255,255,.04);padding:4px 8px;border-radius:4px;margin-top:3px;white-space:pre-wrap;word-break:break-word;}
 .ag-chip{display:inline-block;padding:1px 9px;border-radius:10px;font-size:.72rem;font-weight:700;letter-spacing:.02em;}
+
+/* ── tabs: quiet labels, blue active, no stock red underline ─────────────── */
+.stTabs [data-baseweb="tab-list"]{gap:2px;border-bottom:1px solid var(--bdr);}
+.stTabs [data-baseweb="tab"]{color:var(--mut);font-weight:600;padding:8px 18px;border-radius:8px 8px 0 0;background:transparent;}
+.stTabs [data-baseweb="tab"]:hover{color:var(--txt);background:rgba(0,170,221,.06);}
+.stTabs [aria-selected="true"]{color:var(--blu)!important;}
+.stTabs [data-baseweb="tab-highlight"]{background-color:var(--blu);height:2px;}
+.stTabs [data-baseweb="tab-border"]{background-color:var(--bdr);}
+
+/* ── selects & popover menus (sample picker etc.) ────────────────────────── */
+[data-baseweb="select"] > div{background:var(--bg1)!important;border-color:var(--bdr)!important;color:var(--txt)!important;border-radius:8px!important;}
+[data-baseweb="select"] > div:hover{border-color:var(--blu)!important;}
+[data-baseweb="popover"] [data-baseweb="menu"],[data-baseweb="popover"] ul{background:var(--bg1)!important;border:1px solid var(--bdr)!important;border-radius:8px!important;}
+li[role="option"]{background:var(--bg1)!important;color:var(--txt)!important;}
+li[role="option"]:hover,li[aria-selected="true"][role="option"]{background:rgba(0,170,221,.12)!important;color:#fff!important;}
+[data-baseweb="tag"]{background:rgba(0,170,221,.18)!important;border:1px solid rgba(0,170,221,.4)!important;color:var(--blu)!important;border-radius:10px!important;}
+[data-baseweb="tag"] span{color:var(--blu)!important;}
+
+/* ── pills (filter chips) ─────────────────────────────────────────────────── */
+.stPills [data-testid="stBaseButton-pills"],.stPills [data-testid="stBaseButton-pillsActive"]{border-radius:14px!important;font-size:.8rem!important;padding:2px 12px!important;}
+.stPills [data-testid="stBaseButton-pills"]{background:var(--bg1)!important;border:1px solid var(--bdr)!important;color:var(--mut)!important;}
+.stPills [data-testid="stBaseButton-pills"]:hover{border-color:var(--blu)!important;color:var(--txt)!important;}
+.stPills [data-testid="stBaseButton-pillsActive"]{background:rgba(0,170,221,.16)!important;border:1px solid var(--blu)!important;color:var(--blu)!important;}
+
+/* ── file uploader dropzone ──────────────────────────────────────────────── */
+[data-testid="stFileUploaderDropzone"]{background:var(--bg1)!important;border:1px dashed var(--bdr)!important;border-radius:10px!important;}
+[data-testid="stFileUploaderDropzone"]:hover{border-color:var(--blu)!important;}
+[data-testid="stFileUploaderDropzone"] small,[data-testid="stFileUploaderDropzone"] span{color:var(--mut)!important;}
+
+/* ── download buttons: outline style to read as secondary actions ────────── */
+.stDownloadButton>button{background:transparent!important;border:1px solid var(--blu)!important;color:var(--blu)!important;border-radius:8px!important;font-weight:600!important;}
+.stDownloadButton>button:hover{background:rgba(0,170,221,.12)!important;transform:translateY(-1px);}
+
+/* ── score cards: hover lift + severity-tinted top edge via inline color ─── */
+.nqa-score-card{transition:transform .15s,border-color .15s;border-top:2px solid var(--bdr);}
+.nqa-score-card:hover{transform:translateY(-2px);border-color:var(--blu);}
+
+/* ── hero: gradient rule beneath the title, quiet otherwise ──────────────── */
+.hero-t{letter-spacing:.01em;}
+.hero-s{padding-bottom:10px;border-bottom:2px solid transparent;
+  border-image:linear-gradient(90deg,var(--blu),var(--gld) 45%,transparent 70%) 1;}
+
+/* ── widget labels: muted, consistent ────────────────────────────────────── */
+[data-testid="stWidgetLabel"] p{color:var(--mut)!important;font-size:.82rem!important;font-weight:600!important;}
+
+/* ── expander hover ──────────────────────────────────────────────────────── */
+[data-testid="stExpander"]:hover{border-color:var(--blu)!important;}
+[data-testid="stExpander"] summary{color:var(--txt)!important;font-weight:600;}
+[data-testid="stExpander"] summary:hover{color:var(--blu)!important;}
+
+/* ── inputs: blue focus instead of stock red ─────────────────────────────── */
+textarea:focus,input:focus{border-color:var(--blu)!important;box-shadow:0 0 0 1px var(--blu)!important;}
+:focus-visible{outline:2px solid var(--blu)!important;outline-offset:2px;}
+
+/* ── dark scrollbars ─────────────────────────────────────────────────────── */
+*::-webkit-scrollbar{width:10px;height:10px;}
+*::-webkit-scrollbar-track{background:var(--bg0);}
+*::-webkit-scrollbar-thumb{background:var(--bdr);border-radius:5px;}
+*::-webkit-scrollbar-thumb:hover{background:var(--blu);}
+
+/* ── reduced motion ──────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important;}
+}
 </style>""", unsafe_allow_html=True)
 
 
@@ -987,17 +1051,30 @@ def render_annotated_script(script: str, results: dict):
     # ── filter bar ──────────────────────────────────────────────────────────
     agents_present = sorted({i.get("_agent", "") for i in all_iss if i.get("_agent")})
     agent_labels = {a: a.replace("_", " ").title() for a in agents_present}
-    fc1, fc2, fc3 = st.columns([1.3, 1.7, 2.4])
+    _has_pills = hasattr(st, "pills")
+    fc1, fc2, fc3 = st.columns([1.3, 1.7, 2.6])
     with fc1:
         only_flagged = st.toggle("Flagged lines only", value=False, key="as_only_flagged",
                                  help="Hide clean lines and show just the flagged ones with a line of context.")
     with fc2:
-        sev_sel = st.multiselect("Severity", ["Critical", "Warning", "Info"],
-                                 default=["Critical", "Warning", "Info"], key="as_sev")
+        if _has_pills:
+            sev_sel = st.pills("Severity", ["Critical", "Warning", "Info"],
+                               selection_mode="multi",
+                               default=["Critical", "Warning", "Info"], key="as_sev")
+        else:
+            sev_sel = st.multiselect("Severity", ["Critical", "Warning", "Info"],
+                                     default=["Critical", "Warning", "Info"], key="as_sev")
     with fc3:
-        ag_sel = st.multiselect("Agent", agents_present,
-                                default=agents_present,
-                                format_func=lambda a: agent_labels.get(a, a), key="as_agent")
+        if not agents_present:
+            ag_sel = []
+        elif _has_pills:
+            ag_sel = st.pills("Agent", agents_present, selection_mode="multi",
+                              default=agents_present,
+                              format_func=lambda a: agent_labels.get(a, a), key="as_agent")
+        else:
+            ag_sel = st.multiselect("Agent", agents_present,
+                                    default=agents_present,
+                                    format_func=lambda a: agent_labels.get(a, a), key="as_agent")
 
     # apply filters
     filt = [i for i in all_iss
