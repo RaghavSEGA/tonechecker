@@ -945,12 +945,14 @@ AGENT_META = {
     "Arbiter":           {"icon": "\u2696",     "key": "arbiter"},
 }
 
-def render_agent_progress(statuses: dict[str, str]) -> str:
+def render_agent_progress(statuses: dict[str, str], timings: dict | None = None) -> str:
     rows = []
     for name, meta in AGENT_META.items():
         sv = statuses.get(name, "pending")
         lb = {"pending":"Waiting\u2026","running":"Analysing\u2026",
               "complete":"Done \u2714","error":"Error \u2718"}.get(sv, sv)
+        if timings and name in timings and sv in ("complete", "error"):
+            lb += f' <span style="color:#556;">{timings[name]:.0f}s</span>'
         rows.append(
             f'<div class="ag-row"><div class="ag-dot dot-{sv}"></div>'
             f'<div class="ag-name">{meta["icon"]} {name}</div>'
@@ -1537,6 +1539,8 @@ if script_text.strip():
             "Dialect Sentinel":  lambda: run_dialect_sentinel(client, model_choice, script_text, characters, temperature),
             "Tone Cartographer": lambda: run_tone_cartographer(client, model_choice, script_text, characters, temperature),
         }
+        _timings: dict[str, float] = {}
+        _t0 = time.time()
 
         def _record(agent_name: str, result):
             key = AGENT_META[agent_name]["key"]
@@ -1544,27 +1548,20 @@ if script_text.strip():
                 result = {"parse_error": True, "raw_text": str(result)}
             ar[key] = result
             statuses[agent_name] = "complete" if not result.get("parse_error") else "error"
-            ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
+            _timings[agent_name] = time.time() - _t0
+            ph.markdown(render_agent_progress(statuses, _timings), unsafe_allow_html=True)
 
-        # Staggered-parallel execution: the first agent runs alone so its call
-        # writes the prompt cache (shared system block); the remaining three
-        # then run concurrently and read that cache. Net effect vs serial:
-        # ~2x faster wall-clock and ~3 cached-input calls per run.
-        _names = list(_agent_fns)
-        statuses[_names[0]] = "running"
-        ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
-        try:
-            _first_res = _agent_fns[_names[0]]()
-        except Exception as _e:
-            _first_res = {"parse_error": True, "raw_text": str(_e)}
-        _record(_names[0], _first_res)
-
-        _rest = _names[1:]
-        for n in _rest:
+        # All four agents run fully concurrently. The shared system block is
+        # still cache_control-marked, so re-runs of the same script within the
+        # cache TTL get cached-input pricing; within a single first run the
+        # four concurrent calls each pay full input cost (the cache entry is
+        # only readable after the first request finishes). This trades some
+        # first-run cost for the fastest possible wall-clock time.
+        for n in _agent_fns:
             statuses[n] = "running"
-        ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
-        with ThreadPoolExecutor(max_workers=3) as _ex:
-            _futs = {_ex.submit(_agent_fns[n]): n for n in _rest}
+        ph.markdown(render_agent_progress(statuses, _timings), unsafe_allow_html=True)
+        with ThreadPoolExecutor(max_workers=4) as _ex:
+            _futs = {_ex.submit(fn): n for n, fn in _agent_fns.items()}
             for _fut in as_completed(_futs):
                 _n = _futs[_fut]
                 try:
@@ -1574,13 +1571,15 @@ if script_text.strip():
                 _record(_n, _res)
 
         statuses["Arbiter"] = "running"
-        ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
+        ph.markdown(render_agent_progress(statuses, _timings), unsafe_allow_html=True)
+        _t_arb = time.time()
         ar["arbiter"] = run_arbiter(client, model_choice, ar, temperature)
+        _timings["Arbiter"] = time.time() - _t_arb
         _arb = ar["arbiter"]
         statuses["Arbiter"] = (
             "complete" if isinstance(_arb, dict) and not _arb.get("parse_error") else "error"
         )
-        ph.markdown(render_agent_progress(statuses), unsafe_allow_html=True)
+        ph.markdown(render_agent_progress(statuses, _timings), unsafe_allow_html=True)
 
         st.session_state["results"] = ar
         st.session_state["result_script"] = script_text
