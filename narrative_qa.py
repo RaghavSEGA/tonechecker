@@ -75,6 +75,11 @@ h1,h2,h3,h4,h5,h6{color:#fff!important;}
 .stButton>button:hover{background:#0088BB!important;transform:translateY(-1px);}
 textarea{background:var(--bg1)!important;color:var(--txt)!important;border:1px solid var(--bdr)!important;border-radius:8px!important;}
 [data-testid="stExpander"]{border:1px solid var(--bdr)!important;border-radius:10px!important;background:var(--bg1)!important;}
+.fl-c{background:rgba(204,34,68,.55);color:#fff;padding:0 3px;border-radius:3px;font-weight:600;}
+.fl-w{background:rgba(245,194,24,.45);color:#fff;padding:0 3px;border-radius:3px;font-weight:600;}
+.fl-i{background:rgba(0,170,221,.40);color:#fff;padding:0 3px;border-radius:3px;font-weight:600;}
+.line-quote{font-family:monospace;font-size:.8rem;background:rgba(255,255,255,.04);padding:4px 8px;border-radius:4px;margin-top:3px;white-space:pre-wrap;word-break:break-word;}
+.ag-chip{display:inline-block;padding:1px 9px;border-radius:10px;font-size:.72rem;font-weight:700;letter-spacing:.02em;}
 </style>""", unsafe_allow_html=True)
 
 
@@ -470,6 +475,54 @@ def score_color(score: int) -> str:
     return "#CC2244"
 
 
+# ── analysis history persistence ─────────────────────────────────────────────
+# History is stored per-user (keyed by sign-in email) in a JSON file in the
+# home directory, so it survives page reloads and new sessions on the same
+# container. Each entry records a hash of the script so repeat analyses of the
+# same material can be compared draft-over-draft.
+_HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".snake_nqa_history.json")
+
+def _script_hash(script: str) -> str:
+    """Stable content hash (whitespace-normalised) for draft comparison."""
+    norm = "\n".join(l.strip() for l in script.splitlines() if l.strip())
+    return hashlib.md5(norm.encode("utf-8", errors="replace")).hexdigest()[:10]
+
+def _script_label(script: str) -> str:
+    """Human-readable label: first [SCENE_ID] tag if present, else first line."""
+    for ln in script.splitlines():
+        ln = ln.strip()
+        if not ln or set(ln) <= set("\u2500-\u2014 "):
+            continue
+        m = re.match(r"\[([A-Za-z0-9_]+)\]", ln)
+        if m:
+            return m.group(1)[:34]
+        return (ln[:32] + "\u2026") if len(ln) > 32 else ln
+    return "untitled"
+
+def load_history(email: str) -> list[dict]:
+    try:
+        with open(_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get(email, [])
+    except Exception:
+        return []
+
+def append_history(email: str, entry: dict) -> None:
+    data: dict = {}
+    try:
+        with open(_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        pass
+    data.setdefault(email, []).append(entry)
+    data[email] = data[email][-50:]          # keep last 50 per user
+    try:
+        with open(_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        pass                                  # read-only FS: degrade silently
+
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTHENTICATION — Email OTP via AWS SES
 # SES creds:     AWS_ACCESS_KEY_ID  /  AWS_SECRET_ACCESS_KEY  /  AWS_SES_REGION
@@ -632,27 +685,31 @@ You are VOICE KEEPER for the game SNAKE. Check every dialogue line against CHARA
 Check: vocabulary fingerprint, sentence-construction, emotional register, code-switching, tonal arc.
 RULES: nobody speaks in exposition; profanity is earned; speech rhythms are NOT interchangeable; avoid over-explanation, self-pity, clich\u00e9.
 Report the most impactful issues only — maximum 25, prioritised by severity.
+You cannot know full character backstories, future reveals, or writer intent; apparent inconsistencies may be deliberate (a reveal, growth, deception). When a flag depends on what a character could plausibly know or say, begin the explanation with "Verify with writer:" and frame it as a question to confirm, not a definitive error.
 OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
-{"voice_score":<0-100>,"issues":[{"line_number":<int>,"line_text":"<exact>","character":"<NAME>","issue_type":"<vocabulary_deviation|register_mismatch|emotional_register|code_switching|tonal_arc|exposition>","severity":"<critical|warning|info>","explanation":"<2-3 sent>","direction":"<suggestion, do NOT rewrite>"}]}"""
+{"voice_score":<0-100>,"issues":[{"line_number":<int>,"line_text":"<exact full line>","flagged_phrase":"<exact substring of line_text that is the specific concern>","character":"<NAME>","issue_type":"<vocabulary_deviation|register_mismatch|emotional_register|code_switching|tonal_arc|exposition>","severity":"<critical|warning|info>","explanation":"<2-3 sent>","direction":"<suggestion, do NOT rewrite>"}]}"""
 
 _LW_SYS = """\
 You are LORE WARDEN for SNAKE. Identify any contradiction with established canon, world rules, character histories or timeline.
 Check: factual contradictions, timeline violations, world-rule violations, character knowledge state, relationship state, absent character references.
 Report the most impactful issues only — maximum 25, prioritised by severity.
+You cannot know full character backstories, future reveals, or writer intent; apparent inconsistencies may be deliberate (a reveal, growth, deception). When a flag depends on what a character could plausibly know or say, begin the explanation with "Verify with writer:" and frame it as a question to confirm, not a definitive error.
 OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
-{"lore_score":<0-100>,"issues":[{"line_number":<int>,"line_text":"<exact>","issue_type":"<factual_contradiction|timeline_violation|world_rule|knowledge_state|relationship_state|absent_character>","severity":"<critical|warning|info>","explanation":"<2-3 sent>","resolution_options":"<fixes>"}]}"""
+{"lore_score":<0-100>,"issues":[{"line_number":<int>,"line_text":"<exact full line>","flagged_phrase":"<exact substring of line_text that is the specific concern>","issue_type":"<factual_contradiction|timeline_violation|world_rule|knowledge_state|relationship_state|absent_character>","severity":"<critical|warning|info>","explanation":"<2-3 sent>","resolution_options":"<fixes>"}]}"""
 
 _DS_SYS = """\
 You are DIALECT SENTINEL for SNAKE. Protect linguistic texture.
 Check: faction/region slang, idiom coherence (no real-world idioms that break setting), profanity-system integrity, politeness markers, cultural register, regional Spanish (Cielo = Paraguayan).
 Report the most impactful issues only — maximum 25, prioritised by severity.
+You cannot know full character backstories, future reveals, or writer intent; apparent inconsistencies may be deliberate (a reveal, growth, deception). When a flag depends on what a character could plausibly know or say, begin the explanation with "Verify with writer:" and frame it as a question to confirm, not a definitive error.
 OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
-{"dialect_score":<0-100>,"issues":[{"line_number":<int>,"line_text":"<exact>","character":"<NAME>","issue_type":"<slang_inconsistency|idiom_violation|profanity_misuse|formality_error|cultural_register|language_variant>","severity":"<critical|warning|info>","explanation":"<2-3 sent>","suggestion":"<direction>"}]}"""
+{"dialect_score":<0-100>,"issues":[{"line_number":<int>,"line_text":"<exact full line>","flagged_phrase":"<exact substring of line_text that is the specific concern>","character":"<NAME>","issue_type":"<slang_inconsistency|idiom_violation|profanity_misuse|formality_error|cultural_register|language_variant>","severity":"<critical|warning|info>","explanation":"<2-3 sent>","suggestion":"<direction>"}]}"""
 
 _TC_SYS = """\
 You are TONE CARTOGRAPHER for SNAKE. Analyse scene-level emotional trajectory.
 Check: tonal whiplash, escalation/de-escalation curves, thematic consistency, clich\u00e9s, pacing.
 Report the most impactful issues only — maximum 25, prioritised by severity.
+You cannot know full character backstories, future reveals, or writer intent; apparent inconsistencies may be deliberate (a reveal, growth, deception). When a flag depends on what a character could plausibly know or say, begin the explanation with "Verify with writer:" and frame it as a question to confirm, not a definitive error.
 OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
 {"tone_score":<0-100>,"tone_map":[{"scene_segment":"<beat>","tone_description":"<e.g. restrained tension>","intended_effect":"<player feeling>"}],"issues":[{"scene_segment":"<part>","issue_type":"<tonal_whiplash|flat_escalation|thematic_inconsistency|cliche|pacing>","severity":"<critical|warning|info>","explanation":"<2-3 sent>"}]}"""
 
@@ -661,6 +718,7 @@ You are ARBITER for SNAKE narrative QA. You receive outputs from Voice Keeper, L
 1. Merge & deduplicate overlapping flags.  2. Rank by severity & narrative impact.
 3. Identify cross-agent conflicts.  4. Detect patterns (character flagged repeatedly = possible intentional evolution).
 Top 20 items in priority_list maximum.
+Preserve any "Verify with writer:" framing from agents — these are verification requests, not confirmed errors; do not upgrade them to definitive claims.
 OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
 {"overall_score":<0-100>,"critical_count":<int>,"warning_count":<int>,"info_count":<int>,
 "priority_list":[{"rank":<int>,"agent_source":"<name>","severity":"<lvl>","summary":"<1 sent>","recommendation":"<action>"}],
@@ -743,7 +801,52 @@ def _collect_all_issues(results: dict) -> list[dict]:
             c = dict(iss); c["_agent"] = ak; out.append(c)
     return out
 
+_AGENT_COLORS = {
+    "voice_keeper":      "#C77DFF",
+    "lore_warden":       "#00BB66",
+    "dialect_sentinel":  "#00AADD",
+    "tone_cartographer": "#F5C218",
+}
+
+def _esc(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def _hl_phrase(line_text: str, phrase: str, severity: str) -> str:
+    """Return escaped line_text with the flagged phrase wrapped in a
+    severity-coloured highlight span. Falls back to the plain escaped line
+    when the phrase is missing or not found."""
+    lt = _esc(line_text)
+    ph = _esc((phrase or "").strip())
+    if not ph:
+        return lt
+    cls = {"critical": "fl-c", "warning": "fl-w"}.get((severity or "").lower(), "fl-i")
+    i = lt.lower().find(ph.lower())
+    if i == -1:
+        return lt
+    return lt[:i] + f'<span class="{cls}">' + lt[i:i+len(ph)] + "</span>" + lt[i+len(ph):]
+
+def _agent_chip(agent_key: str) -> str:
+    clr = _AGENT_COLORS.get(agent_key, "#8899BB")
+    nm = agent_key.replace("_", " ").title()
+    return f'<span class="ag-chip" style="background:{clr}22;color:{clr};border:1px solid {clr}66;">{nm}</span>'
+
 def render_annotated_script(script: str, results: dict):
+    # legend
+    leg = " ".join(
+        f'<span class="ag-chip" style="background:{c}22;color:{c};border:1px solid {c}66;">'
+        f'{AGENT_META[n]["icon"]} {n}</span>'
+        for n, c in [("Voice Keeper", _AGENT_COLORS["voice_keeper"]),
+                     ("Lore Warden", _AGENT_COLORS["lore_warden"]),
+                     ("Dialect Sentinel", _AGENT_COLORS["dialect_sentinel"]),
+                     ("Tone Cartographer", _AGENT_COLORS["tone_cartographer"])])
+    st.markdown(
+        f'<div style="margin-bottom:10px;">{leg} &nbsp;&nbsp;'
+        f'<span class="sev-c">Critical</span> <span class="sev-w">Warning</span> '
+        f'<span class="sev-i">Info</span> '
+        f'<span style="color:#667;font-size:.78rem;">\u2014 line background = highest severity; '
+        f'highlighted text = flagged phrase</span></div>',
+        unsafe_allow_html=True)
+
     all_iss = _collect_all_issues(results)
     lines = script.split("\n")
     lm: dict[int, list[dict]] = {}
@@ -757,29 +860,33 @@ def render_annotated_script(script: str, results: dict):
             for idx, raw in enumerate(lines, 1):
                 if lt.lower() in raw.lower():
                     lm.setdefault(idx, []).append(iss); break
+
+    SEV_RANK = {"critical": 0, "hard": 0, "high": 0,
+                "warning": 1, "medium": 1, "soft": 1}
     hp = ['<div style="font-family:monospace;font-size:.88rem;line-height:1.6;">']
     for idx, line in enumerate(lines, 1):
-        issues = lm.get(idx, [])
+        issues = sorted(lm.get(idx, []),
+                        key=lambda i: SEV_RANK.get((i.get("severity") or "").lower(), 2))
         if issues:
-            w = "info"
-            for i in issues:
-                s = (i.get("severity") or "").lower()
-                if s in ("critical","hard","high"): w = "critical"; break
-                if s in ("warning","medium","soft"): w = "warning"
+            top = issues[0]
+            w = {0: "critical", 1: "warning"}.get(
+                SEV_RANK.get((top.get("severity") or "").lower(), 2), "info")
             cls = f"aline al-{w[0]}"
+            # highlight the top issue's flagged phrase inside the source line
+            sl = _hl_phrase(line, top.get("flagged_phrase", ""), top.get("severity", ""))
         else:
             cls = "aline al-ok" if line.strip() else "aline"
-        sl = line.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            sl = _esc(line)
         hp.append(f'<div class="{cls}"><span style="color:#555;margin-right:8px;">{idx:>3}</span>{sl}</div>')
         for i in issues:
-            b = get_severity_badge(i.get("severity","info"))
-            ex = (i.get("explanation") or i.get("summary") or "").replace("<","&lt;")
-            dr = (i.get("direction") or i.get("suggestion") or "").replace("<","&lt;")
-            ag = i.get("_agent","").replace("_"," ").title()
+            b = get_severity_badge(i.get("severity", "info"))
+            ex = _esc(i.get("explanation") or i.get("summary") or "")
+            dr = _esc(i.get("direction") or i.get("suggestion") or i.get("resolution_options") or "")
+            chip = _agent_chip(i.get("_agent", ""))
             hp.append(
                 f'<div style="margin:2px 0 6px 36px;padding:6px 12px;background:rgba(255,255,255,.03);'
                 f'border-radius:6px;font-size:.82rem;">'
-                f'{b} <strong style="color:#aaa;">[{ag}]</strong> {ex}'
+                f'{b} {chip} {ex}'
                 + (f'<br/><em style="color:var(--blu);">\u27A4 {dr}</em>' if dr else "")
                 + "</div>")
     hp.append("</div>")
@@ -788,14 +895,26 @@ def render_annotated_script(script: str, results: dict):
 def render_issues_table(issues: list[dict], columns: list[str]):
     if not issues:
         st.info("No issues found by this agent. \U0001F389"); return
-    hdr = "".join(f"<th style='padding:8px 12px;text-align:left;border-bottom:1px solid #1A2A4A;color:#00AADD;'>{c}</th>" for c in columns)
+    hdr = "".join(f"<th style='padding:8px 12px;text-align:left;border-bottom:1px solid #1A2A4A;color:#00AADD;'>{c.replace('_',' ')}</th>" for c in columns)
     rw = ""
     for iss in issues:
         cells = ""
         for c in columns:
-            k = c.lower().replace(" ","_")
-            v = iss.get(k, "")
-            cells += f"<td style='padding:8px 12px;border-bottom:1px solid #0D1B2A;font-size:.85rem;'>{get_severity_badge(str(v)) if k=='severity' else str(v).replace('<','&lt;')}</td>"
+            k = c.lower().replace(" ", "_")
+            if k == "line":
+                num = iss.get("line_number", "")
+                qt = _hl_phrase(iss.get("line_text", ""), iss.get("flagged_phrase", ""),
+                                iss.get("severity", ""))
+                v_html = (f'<span style="color:#667;font-size:.75rem;">line {num}</span>'
+                          f'<div class="line-quote">{qt}</div>') if qt.strip() else \
+                         f'<span style="color:#667;">line {num}</span>'
+                cells += f"<td style='padding:8px 12px;border-bottom:1px solid #0D1B2A;font-size:.85rem;min-width:240px;'>{v_html}</td>"
+                continue
+            if k == "direction":
+                v = iss.get("direction") or iss.get("suggestion") or iss.get("resolution_options") or ""
+            else:
+                v = iss.get(k, "")
+            cells += f"<td style='padding:8px 12px;border-bottom:1px solid #0D1B2A;font-size:.85rem;'>{get_severity_badge(str(v)) if k=='severity' else _esc(str(v))}</td>"
         rw += f"<tr>{cells}</tr>"
     st.markdown(
         f'<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;background:#0A1628;border-radius:8px;">'
@@ -805,24 +924,42 @@ def render_character_reports(characters: list[str], results: dict):
     all_iss = _collect_all_issues(results)
     for char in characters:
         short = char.split()[0]
-        ci = [i for i in all_iss if short.lower() in (i.get("character","") or "").lower()
-              or short.lower() in (i.get("line_text","") or "").lower()]
+        ci = [i for i in all_iss if short.lower() in (i.get("character", "") or "").lower()
+              or short.lower() in (i.get("line_text", "") or "").lower()]
         with st.expander(f"\U0001F464 {char}  ({len(ci)} issue{'s' if len(ci)!=1 else ''})"):
             pr = CHARACTER_PROFILES.get(char, "Profile not found.")
             st.markdown(
                 f'<div class="nqa-card" style="border-left:3px solid #00AADD;">'
                 f'<strong style="color:#00AADD;">Canonical Voice Profile</strong><br/>'
-                f'<span style="color:#ccc;">{pr}</span></div>', unsafe_allow_html=True)
-            if ci: render_issues_table(ci, ["Severity","Issue_Type","Explanation","Direction"])
-            else: st.success("No issues for this character.")
+                f'<span style="color:#ccc;">{_esc(pr)}</span></div>', unsafe_allow_html=True)
+            if not ci:
+                st.success("No issues for this character."); continue
+            # card per issue: quoted line with highlight, then verdict
+            for i in ci:
+                b = get_severity_badge(i.get("severity", "info"))
+                chip = _agent_chip(i.get("_agent", ""))
+                num = i.get("line_number", "?")
+                qt = _hl_phrase(i.get("line_text", ""), i.get("flagged_phrase", ""),
+                                i.get("severity", ""))
+                ex = _esc(i.get("explanation") or "")
+                dr = _esc(i.get("direction") or i.get("suggestion") or i.get("resolution_options") or "")
+                it = _esc(str(i.get("issue_type", "")))
+                st.markdown(
+                    f'<div class="nqa-card" style="padding:10px 16px;margin:6px 0;">'
+                    f'{b} {chip} <span style="color:#8899BB;font-size:.8rem;">{it} \u00B7 line {num}</span>'
+                    f'<div class="line-quote">{qt}</div>'
+                    f'<div style="color:#ccc;font-size:.85rem;margin-top:6px;">{ex}</div>'
+                    + (f'<em style="color:var(--blu);font-size:.85rem;">\u27A4 {dr}</em>' if dr else "")
+                    + "</div>", unsafe_allow_html=True)
 
 def build_csv_export(results: dict) -> str:
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["Agent","Line#","Character","Severity","Type","Explanation","Direction"])
+    w.writerow(["Agent","Line#","Line Text","Flagged Phrase","Character","Severity","Type","Explanation","Direction"])
     for ak in ("voice_keeper","lore_warden","dialect_sentinel","tone_cartographer"):
         for i in results.get(ak, {}).get("issues", []):
-            w.writerow([ak, i.get("line_number",""), i.get("character",""),
+            w.writerow([ak, i.get("line_number",""), i.get("line_text",""),
+                        i.get("flagged_phrase",""), i.get("character",""),
                         i.get("severity",""), i.get("issue_type",""),
                         i.get("explanation",""),
                         i.get("direction", i.get("suggestion", i.get("resolution_options","")))])
@@ -841,28 +978,58 @@ with st.sidebar:
         '</div>', unsafe_allow_html=True)
     st.divider()
 
-    model_choice = st.selectbox("LLM model", [DEFAULT_MODEL,
-        "us.anthropic.claude-sonnet-4-20250514",
-        "anthropic.claude-3-5-sonnet-20241022-v2:0"], index=0)
-    temperature = st.slider("Temperature", 0.0, 0.5, 0.15, 0.05)
+    model_choice = DEFAULT_MODEL          # Claude Sonnet 4.6 on AWS Bedrock
+    st.markdown(
+        '<div style="font-size:.8rem;color:#8899BB;">Model<br/>'
+        '<strong style="color:#00AADD;">Claude Sonnet 4.6</strong> '
+        '<span style="color:#556;">on AWS Bedrock</span></div>',
+        unsafe_allow_html=True)
+    temperature = st.slider("Temperature", 0.0, 0.5, 0.15, 0.05,
+        help="Controls randomness in the analysis. 0 = fully deterministic \u2014 the "
+             "same script yields nearly identical flags every run (best for QA). "
+             "Higher values explore subtler interpretations but vary more between runs.")
 
     st.divider()
-    with st.expander("\U0001F4D6 Style Guide Reference"):
-        st.text_area("guide", STYLE_GUIDE_TEXT, height=300, disabled=True, label_visibility="collapsed")
+    with st.expander("📖 Style Guide Reference"):
+        st.caption("The canonical SNAKE style guide \u2014 every agent receives this verbatim with each analysis.")
+        _sg = STYLE_GUIDE_TEXT.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        st.markdown(
+            f'<div style="max-height:320px;overflow-y:auto;font-size:.78rem;line-height:1.5;'
+            f'color:#ccc;white-space:pre-wrap;background:#0D1B2A;padding:10px;border-radius:8px;">{_sg}</div>',
+            unsafe_allow_html=True)
 
     st.divider()
     st.markdown("**\U0001F4DC Analysis History**")
-    history = st.session_state.get("history", [])
+    _email_sb = st.session_state.get("auth_email", "")
+    history = load_history(_email_sb) if _email_sb else st.session_state.get("history", [])
     if history:
-        for h in reversed(history[-10:]):
+        for _pos in range(len(history) - 1, max(-1, len(history) - 11), -1):
+            h = history[_pos]
             sc = h.get("score", "?")
+            # draft-over-draft delta vs the previous run of the same script
+            delta_html = ""
+            _hsh = h.get("script_hash")
+            if _hsh:
+                for _q in range(_pos - 1, -1, -1):
+                    if history[_q].get("script_hash") == _hsh:
+                        _prev = history[_q].get("score")
+                        if isinstance(_prev, (int, float)) and isinstance(sc, (int, float)):
+                            _d = sc - _prev
+                            if _d > 0:   delta_html = f' <span style="color:var(--grn);font-weight:700;">\u25B2+{_d}</span>'
+                            elif _d < 0: delta_html = f' <span style="color:var(--red);font-weight:700;">\u25BC{_d}</span>'
+                            else:        delta_html = ' <span style="color:#777;">\u3003</span>'
+                        break
+            _lbl = h.get("script_label", "")
             st.markdown(
-                f'<div style="padding:6px;margin:4px 0;background:#0D1B2A;border-radius:6px;font-size:.8rem;">'
-                f'<strong style="color:{score_color(int(sc) if isinstance(sc,(int,float)) else 0)}">{sc}/100</strong>'
-                f' &middot; {", ".join(h.get("characters",[])[:3])} &middot; '
-                f'<span style="color:#555;">{h.get("timestamp","")}</span></div>', unsafe_allow_html=True)
+                f'<div style="padding:6px 8px;margin:4px 0;background:#0D1B2A;border-radius:6px;font-size:.78rem;">'
+                f'<strong style="color:{score_color(int(sc) if isinstance(sc,(int,float)) else 0)}">{sc}/100</strong>{delta_html}'
+                + (f' &middot; <span style="color:#ccc;">{_lbl}</span>' if _lbl else "")
+                + f'<br/><span style="color:#556;">{h.get("timestamp","")}'
+                + (f' &middot; {", ".join(h.get("characters", [])[:3])}' if h.get("characters") else "")
+                + '</span></div>', unsafe_allow_html=True)
+        st.caption("\u25B2\u25BC = change vs the previous run of the same script.")
     else:
-        st.caption("No analyses yet.")
+        st.caption("No analyses yet for this account.")
 
     st.divider()
     st.markdown(
@@ -1014,10 +1181,19 @@ if script_text.strip():
         _arb_hist = ar.get("arbiter", {})
         if not isinstance(_arb_hist, dict):
             _arb_hist = {}
-        st.session_state.setdefault("history", []).append({
+        _hist_entry = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "score": _arb_hist.get("overall_score", "?"),
-            "characters": characters})
+            "characters": characters,
+            "script_hash": _script_hash(script_text),
+            "script_label": _script_label(script_text),
+            "critical": _arb_hist.get("critical_count", 0),
+            "warning": _arb_hist.get("warning_count", 0),
+        }
+        _email_run = st.session_state.get("auth_email", "")
+        if _email_run:
+            append_history(_email_run, _hist_entry)
+        st.session_state.setdefault("history", []).append(_hist_entry)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1058,15 +1234,15 @@ if "results" in st.session_state:
         with st.expander("\U0001F3AD Voice Keeper", expanded=True):
             st.markdown(f"**Voice Score: {vk.get('voice_score','?')}**/100")
             render_issues_table(vk.get("issues",[]),
-                ["Line_Number","Character","Issue_Type","Severity","Explanation","Direction"])
+                ["Line","Character","Issue_Type","Severity","Explanation","Direction"])
         with st.expander("\U0001F4DC Lore Warden"):
             st.markdown(f"**Lore Score: {lw.get('lore_score','?')}**/100")
             render_issues_table(lw.get("issues",[]),
-                ["Line_Number","Issue_Type","Severity","Explanation","Resolution_Options"])
+                ["Line","Issue_Type","Severity","Explanation","Resolution_Options"])
         with st.expander("\U0001F5E3 Dialect Sentinel"):
             st.markdown(f"**Dialect Score: {ds.get('dialect_score','?')}**/100")
             render_issues_table(ds.get("issues",[]),
-                ["Line_Number","Character","Issue_Type","Severity","Explanation","Suggestion"])
+                ["Line","Character","Issue_Type","Severity","Explanation","Suggestion"])
         with st.expander("\U0001F3B5 Tone Cartographer"):
             st.markdown(f"**Tone Score: {tc.get('tone_score','?')}**/100")
             for seg in tc.get("tone_map",[]):
