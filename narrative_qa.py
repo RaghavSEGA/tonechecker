@@ -225,6 +225,66 @@ def detect_characters(script: str) -> list[str]:
     return sorted(set(found))
 
 
+def _scan_balanced(raw: str, open_ch: str, close_ch: str):
+    """Extract the first balanced {...} or [...] from raw, ignoring brackets
+    that appear inside JSON string literals."""
+    idx = raw.find(open_ch)
+    if idx == -1:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(idx, len(raw)):
+        ch = raw[i]
+        if in_str:
+            if esc:           esc = False
+            elif ch == "\\": esc = True
+            elif ch == '"':   in_str = False
+        else:
+            if ch == '"':       in_str = True
+            elif ch == open_ch:  depth += 1
+            elif ch == close_ch:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(raw[idx:i+1])
+                    except Exception:
+                        return None
+    return None
+
+
+def _repair_truncated_json(raw: str):
+    """Best-effort recovery of JSON that was cut off mid-stream (e.g. the
+    model hit max_tokens). Trims back to the last syntactically complete
+    token, strips a dangling comma, then closes any open brackets."""
+    start = raw.find("{")
+    if start == -1:
+        return None
+    s = raw[start:]
+    stack: list[str] = []
+    in_str = esc = False
+    last_good = 0
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:            esc = False
+            elif ch == "\\":  esc = True
+            elif ch == '"':
+                in_str = False
+                last_good = i + 1
+        else:
+            if ch == '"':       in_str = True
+            elif ch in "{[":    stack.append(ch)
+            elif ch in "}]":
+                if stack: stack.pop()
+                last_good = i + 1
+            elif ch not in ", :\n\t\r":
+                last_good = i + 1          # number / true / false / null chars
+    cand = s[:last_good].rstrip().rstrip(",")
+    closers = "".join("}" if c == "{" else "]" for c in reversed(stack))
+    try:
+        return json.loads(cand + closers)
+    except Exception:
+        return None
+
+
 def parse_llm_json(raw: str) -> Any:
     raw = raw.strip()
 
@@ -237,22 +297,28 @@ def parse_llm_json(raw: str) -> Any:
             return {"raw_text": raw, "parse_error": True}
         return obj
 
-    try: return _ensure_dict(json.loads(raw))
-    except Exception: pass
+    # 1. whole string is valid JSON
+    try:
+        return _ensure_dict(json.loads(raw))
+    except Exception:
+        pass
+    # 2. fenced ```json block
     m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", raw, re.S)
     if m:
-        try: return _ensure_dict(json.loads(m.group(1)))
-        except Exception: pass
+        try:
+            return _ensure_dict(json.loads(m.group(1)))
+        except Exception:
+            pass
+    # 3. string-aware balanced extraction ({ first, then [)
     for co, cc in [("{", "}"), ("[", "]")]:
-        idx = raw.find(co)
-        if idx != -1:
-            d = 0
-            for i in range(idx, len(raw)):
-                if raw[i] == co: d += 1
-                elif raw[i] == cc: d -= 1
-                if d == 0:
-                    try: return _ensure_dict(json.loads(raw[idx:i+1]))
-                    except Exception: break
+        obj = _scan_balanced(raw, co, cc)
+        if obj is not None:
+            return _ensure_dict(obj)
+    # 4. truncation repair (model hit max_tokens mid-object)
+    obj = _repair_truncated_json(raw)
+    if obj is not None:
+        obj["_truncation_repaired"] = True
+        return _ensure_dict(obj)
     return {"raw_text": raw, "parse_error": True}
 
 
@@ -708,10 +774,12 @@ OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
 _TC_SYS = """\
 You are TONE CARTOGRAPHER for SNAKE. Analyse scene-level emotional trajectory.
 Check: tonal whiplash, escalation/de-escalation curves, thematic consistency, clich\u00e9s, pacing.
-Report the most impactful issues only — maximum 25, prioritised by severity.
+Keep tone_map to at most 12 segments — group adjacent scenes that share a tone rather than listing every scene.
+Keep all text fields concise (1-2 sentences). Report the most impactful issues only — maximum 15, prioritised by severity.
+For each issue also include the line_number and exact line_text of ONE representative line from that segment (use the numeric prefix shown in the script).
 You cannot know full character backstories, future reveals, or writer intent; apparent inconsistencies may be deliberate (a reveal, growth, deception). When a flag depends on what a character could plausibly know or say, begin the explanation with "Verify with writer:" and frame it as a question to confirm, not a definitive error.
 OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
-{"tone_score":<0-100>,"tone_map":[{"scene_segment":"<beat>","tone_description":"<e.g. restrained tension>","intended_effect":"<player feeling>"}],"issues":[{"scene_segment":"<part>","issue_type":"<tonal_whiplash|flat_escalation|thematic_inconsistency|cliche|pacing>","severity":"<critical|warning|info>","explanation":"<2-3 sent>"}]}"""
+{"tone_score":<0-100>,"tone_map":[{"scene_segment":"<beat>","tone_description":"<e.g. restrained tension>","intended_effect":"<player feeling>"}],"issues":[{"scene_segment":"<part>","line_number":<int representative line>,"line_text":"<exact representative line>","issue_type":"<tonal_whiplash|flat_escalation|thematic_inconsistency|cliche|pacing>","severity":"<critical|warning|info>","explanation":"<2-3 sent>"}]}"""
 
 _ARB_SYS = """\
 You are ARBITER for SNAKE narrative QA. You receive outputs from Voice Keeper, Lore Warden, Dialect Sentinel, Tone Cartographer.
@@ -727,10 +795,21 @@ OUTPUT ONLY a single valid JSON object — no prose, no markdown fences:
 
 # ── agent runners ───────────────────────────────────────────────────────────
 
+def _numbered_script(script: str) -> str:
+    """Prefix every line with its 1-based number so agents report exact,
+    verifiable line references."""
+    return "\n".join(f"{i:>4} | {l}" for i, l in enumerate(script.split("\n"), 1))
+
 def _build_user_prompt(script: str, characters: list[str]) -> str:
     return (f"## STYLE GUIDE\n{STYLE_GUIDE_TEXT}\n\n"
             f"## DETECTED CHARACTER PROFILES\n{relevant_profiles(characters)}\n\n"
-            f"## SCRIPT TO ANALYSE\n```\n{script}\n```\n\n"
+            f"## SCRIPT TO ANALYSE\n"
+            f"Each line is prefixed with its line number and ' | '.\n"
+            f"```\n{_numbered_script(script)}\n```\n\n"
+            "When reporting an issue: line_number MUST be the numeric prefix of the "
+            "flagged line exactly as shown; line_text MUST be the exact text AFTER "
+            "the ' | ' separator (never include the number prefix); flagged_phrase "
+            "MUST be copied verbatim from within line_text.\n"
             "Return ONLY valid JSON matching your schema.")
 
 def run_voice_keeper(client, model, script, characters, temp):
@@ -830,6 +909,38 @@ def _agent_chip(agent_key: str) -> str:
     nm = agent_key.replace("_", " ").title()
     return f'<span class="ag-chip" style="background:{clr}22;color:{clr};border:1px solid {clr}66;">{nm}</span>'
 
+def _norm_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+def _attach_issues_to_lines(lines: list[str], all_iss: list[dict]):
+    """Map each issue to a script line. An agent-supplied line_number is only
+    trusted when the issue's line_text actually matches that line; otherwise
+    we search the whole script for the quoted text. Returns (line_map,
+    unmatched) where unmatched holds issues that could not be pinned."""
+    norm_lines = [_norm_text(l) for l in lines]
+    lm: dict[int, list[dict]] = {}
+    unmatched: list[dict] = []
+
+    def _matches(nl: str, nt: str) -> bool:
+        return bool(nt) and bool(nl) and (nt in nl or nl in nt)
+
+    for iss in all_iss:
+        ln = iss.get("line_number")
+        nt = _norm_text(iss.get("line_text", ""))
+        attached = False
+        # 1. trust line_number only if the text corroborates (or no text given)
+        if isinstance(ln, int) and 1 <= ln <= len(lines):
+            if not nt or _matches(norm_lines[ln - 1], nt):
+                lm.setdefault(ln, []).append(iss); attached = True
+        # 2. otherwise locate by quoted text anywhere in the script
+        if not attached and nt:
+            for idx, nl in enumerate(norm_lines, 1):
+                if _matches(nl, nt):
+                    lm.setdefault(idx, []).append(iss); attached = True; break
+        if not attached:
+            unmatched.append(iss)
+    return lm, unmatched
+
 def render_annotated_script(script: str, results: dict):
     # legend
     leg = " ".join(
@@ -849,20 +960,24 @@ def render_annotated_script(script: str, results: dict):
 
     all_iss = _collect_all_issues(results)
     lines = script.split("\n")
-    lm: dict[int, list[dict]] = {}
-    for iss in all_iss:
-        ln = iss.get("line_number")
-        if isinstance(ln, int) and 0 < ln <= len(lines):
-            lm.setdefault(ln, []).append(iss)
-    for iss in all_iss:
-        lt = (iss.get("line_text") or "").strip()
-        if lt and iss.get("line_number") is None:
-            for idx, raw in enumerate(lines, 1):
-                if lt.lower() in raw.lower():
-                    lm.setdefault(idx, []).append(iss); break
+    lm, unmatched = _attach_issues_to_lines(lines, all_iss)
 
     SEV_RANK = {"critical": 0, "hard": 0, "high": 0,
                 "warning": 1, "medium": 1, "soft": 1}
+
+    def _issue_note(i: dict) -> str:
+        b = get_severity_badge(i.get("severity", "info"))
+        ex = _esc(i.get("explanation") or i.get("summary") or "")
+        dr = _esc(i.get("direction") or i.get("suggestion") or i.get("resolution_options") or "")
+        chip = _agent_chip(i.get("_agent", ""))
+        seg = i.get("scene_segment")
+        seg_html = f'<span style="color:#8899BB;font-size:.78rem;">[{_esc(str(seg))}]</span> ' if seg else ""
+        return (f'<div style="margin:2px 0 6px 36px;padding:6px 12px;background:rgba(255,255,255,.03);'
+                f'border-radius:6px;font-size:.82rem;">'
+                f'{b} {chip} {seg_html}{ex}'
+                + (f'<br/><em style="color:var(--blu);">\u27A4 {dr}</em>' if dr else "")
+                + "</div>")
+
     hp = ['<div style="font-family:monospace;font-size:.88rem;line-height:1.6;">']
     for idx, line in enumerate(lines, 1):
         issues = sorted(lm.get(idx, []),
@@ -872,25 +987,31 @@ def render_annotated_script(script: str, results: dict):
             w = {0: "critical", 1: "warning"}.get(
                 SEV_RANK.get((top.get("severity") or "").lower(), 2), "info")
             cls = f"aline al-{w[0]}"
-            # highlight the top issue's flagged phrase inside the source line
             sl = _hl_phrase(line, top.get("flagged_phrase", ""), top.get("severity", ""))
         else:
             cls = "aline al-ok" if line.strip() else "aline"
             sl = _esc(line)
         hp.append(f'<div class="{cls}"><span style="color:#555;margin-right:8px;">{idx:>3}</span>{sl}</div>')
         for i in issues:
-            b = get_severity_badge(i.get("severity", "info"))
-            ex = _esc(i.get("explanation") or i.get("summary") or "")
-            dr = _esc(i.get("direction") or i.get("suggestion") or i.get("resolution_options") or "")
-            chip = _agent_chip(i.get("_agent", ""))
-            hp.append(
-                f'<div style="margin:2px 0 6px 36px;padding:6px 12px;background:rgba(255,255,255,.03);'
-                f'border-radius:6px;font-size:.82rem;">'
-                f'{b} {chip} {ex}'
-                + (f'<br/><em style="color:var(--blu);">\u27A4 {dr}</em>' if dr else "")
-                + "</div>")
+            hp.append(_issue_note(i))
     hp.append("</div>")
     st.markdown("".join(hp), unsafe_allow_html=True)
+
+    # scene-level / unpinned issues — visible instead of silently dropped
+    if unmatched:
+        st.markdown(
+            f'<div style="margin-top:14px;"><strong style="color:#F5C218;">'
+            f'\U0001F4CC Scene-level &amp; unpinned issues ({len(unmatched)})</strong> '
+            f'<span style="color:#667;font-size:.78rem;">\u2014 these flags could not be '
+            f'matched to a single script line (scene-wide notes, or the agent\u2019s line '
+            f'reference didn\u2019t match)</span></div>', unsafe_allow_html=True)
+        blk = []
+        for i in unmatched:
+            qt = i.get("line_text", "")
+            quote_html = (f'<div class="line-quote">{_hl_phrase(qt, i.get("flagged_phrase",""), i.get("severity",""))}</div>'
+                          if qt else "")
+            blk.append(_issue_note(i).replace('margin:2px 0 6px 36px;', 'margin:6px 0;') + quote_html)
+        st.markdown("".join(blk), unsafe_allow_html=True)
 
 def render_issues_table(issues: list[dict], columns: list[str]):
     if not issues:
@@ -1231,6 +1352,18 @@ if "results" in st.session_state:
         render_annotated_script(scr, res)
 
     with t2:
+        # surface parse failures so errors are debuggable instead of silent
+        for _nm, _d in [("Voice Keeper", vk), ("Lore Warden", lw),
+                        ("Dialect Sentinel", ds), ("Tone Cartographer", tc),
+                        ("Arbiter", arb)]:
+            if _d.get("parse_error"):
+                st.error(f"\u26A0\uFE0F {_nm} returned a response that couldn't be parsed as JSON. "
+                         "Its results are missing from this analysis \u2014 try re-running.")
+                with st.expander(f"Raw {_nm} response (for debugging)"):
+                    st.code(str(_d.get("raw_text", ""))[:6000], language="text")
+            elif _d.get("_truncation_repaired"):
+                st.warning(f"\u2702\uFE0F {_nm}'s response was cut off mid-stream and automatically "
+                           "repaired \u2014 the tail end of its issue list may be missing.")
         with st.expander("\U0001F3AD Voice Keeper", expanded=True):
             st.markdown(f"**Voice Score: {vk.get('voice_score','?')}**/100")
             render_issues_table(vk.get("issues",[]),
